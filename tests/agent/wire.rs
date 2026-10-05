@@ -114,6 +114,8 @@ fn browser_generated_integrity_events_all_verify_in_the_agent() {
 
 #[test]
 fn data_event_handling_uses_frontend_topics() {
+    // Enough code to earn execution credit, so the run is narrated.
+    const NEW_CODE: &str = "function solve(nums) { return nums.slice().sort((a, b) => a - b); }";
     let mut state = near_time_up(RuntimeState {
         code: "old".to_string(),
         language: "python".to_string(),
@@ -133,17 +135,17 @@ fn data_event_handling_uses_frontend_topics() {
     let code_update = apply_data_event(
         &mut state,
         "code_update",
-        &json!({"code": "new"}),
+        &json!({"code": NEW_CODE}),
         TEST_REACTION_COOLDOWN_S,
     );
     assert!(code_update.update_last_code_change);
-    assert_eq!(state.code, "new");
+    assert_eq!(state.code, NEW_CODE);
     assert_eq!(state.language, "javascript");
 
     let test_results = apply_data_event(
         &mut state,
         "test_results",
-        &json!({"language":"python","passed":2,"total":2,"setupError":0.0,"failures":[]}),
+        &json!({"code":NEW_CODE,"language":"javascript","passed":2,"total":2,"setupError":0.0,"failures":[]}),
         TEST_REACTION_COOLDOWN_S,
     );
     assert_eq!(state.test_runs, 1);
@@ -1180,7 +1182,7 @@ fn a_test_run_during_a_hold_is_told_to_the_model_without_asking_for_a_reply() {
     let result = apply_data_event(
         &mut state,
         "test_results",
-        &json!({"language":"python","passed":2,"total":2,"setupError":0.0,"failures":[]}),
+        &json!({"code":"def f():\n    return 1","language":"python","passed":2,"total":2,"setupError":0.0,"failures":[]}),
         TEST_REACTION_COOLDOWN_S,
     );
     assert!(result.generate_reply.is_none(), "the hold keeps Jim quiet");

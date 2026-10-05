@@ -20,9 +20,10 @@ use ::livekit::data_stream::api::StreamTextOptions;
 use ::livekit::prelude::Room;
 
 use crate::agent::{
-    CANDIDATE_SPEAKER, INTERVIEWER_SPEAKER, ModelInputKind, RuntimeState, SpeakerTurn, TestRunNote,
-    framework_progress, phase_id, read_editor_text, record_framework_evidence, released_follow_ups,
-    unrecorded_earlier_phases, with_timer, wrap_up,
+    CANDIDATE_SPEAKER, INTERVIEWER_SPEAKER, ModelInputKind, RecordOutcome, RuntimeState,
+    SpeakerTurn, TestRunNote, framework_progress, phase_id, read_editor_text,
+    record_framework_evidence_outcome, released_follow_ups, unrecorded_earlier_phases, with_timer,
+    wrap_up,
 };
 use crate::gemini::{GeminiEvent, GeminiFunctionCall, GeminiLiveSession};
 use crate::runtime::{
@@ -486,7 +487,6 @@ async fn on_tool_calls(
     if calls.is_empty() {
         return Ok(());
     }
-    let shown_before = framework_progress(context.state);
     let answers = calls
         .into_iter()
         .map(|call| {
@@ -519,7 +519,12 @@ async fn on_tool_calls(
     // Not `?`. A response that did not go out is owed nothing back, so the flag
     // stays down, and the socket it failed on is replaced when its close is
     // reported; the checklist below still reflects the calls.
-    match context.gemini.send_tool_responses(&answers).await {
+    let sent = context.gemini.send_tool_responses(&answers).await;
+
+    // A reminder of open earlier steps in a response that never went out has
+    // not been read, so it may be named again.
+    context.state.settle_earlier_steps(sent.is_ok());
+    match sent {
         // Gemini now owes a generation for this, and will deliver it on this
         // socket or not at all.
         Ok(()) => {
@@ -532,9 +537,7 @@ async fn on_tool_calls(
             );
         }
     }
-    if checklist_changed(&shown_before, context.state) {
-        publish_framework_progress(room, context.state).await?;
-    }
+    flush_framework_progress(room, context.state).await;
     Ok(())
 }
 
@@ -909,6 +912,14 @@ fn agent_state_attributes(
 pub fn execute_tool_call(state: &mut RuntimeState, call: &GeminiFunctionCall) -> serde_json::Value {
     let mut response = tool_response(state, call);
 
+    // Only where the interviewer checks what is marked: every reply stays in
+    // its context and is billed again on each later turn.
+    if [TOOL_READ_EDITOR, TOOL_RECORD_FRAMEWORK_EVIDENCE].contains(&call.name.as_str()) {
+        response["frameworkState"] = serde_json::json!({
+            "phases": framework_progress(state),
+        });
+    }
+
     // Only under an explicit compression window, where the dialogue before a
     // tool call can leave the context while the model waits on the answer.
     // Without one this is text every later turn is billed for again.
@@ -1015,14 +1026,20 @@ fn tool_response(state: &mut RuntimeState, call: &GeminiFunctionCall) -> serde_j
         TOOL_RECORD_FRAMEWORK_EVIDENCE => {
             let was_complete = crate::agent::coding_round_complete(state);
             let shown_before = framework_progress(state);
-            match record_framework_evidence(state, &call.args) {
+            match record_framework_evidence_outcome(state, &call.args) {
                 // The phase alone. The row echoed back was the model's own
                 // arguments plus a timestamp and a version, held in the session
                 // for the rest of the interview on every call.
-                Ok(evidence) => {
-                    let mut response = serde_json::json!({
-                        "result": format!("Recorded {}.", phase_id(evidence.phase))
-                    });
+                Ok((evidence, outcome)) => {
+                    let phase = phase_id(evidence.phase);
+                    let result = match outcome {
+                        RecordOutcome::Added => format!("Recorded {phase}."),
+                        RecordOutcome::TestAlreadyRecorded => "Test was already recorded by the platform when the run arrived; nothing was added.".to_string(),
+                        RecordOutcome::AlreadyHeld => {
+                            format!("{phase} already holds this note; nothing was added.")
+                        }
+                    };
+                    let mut response = serde_json::json!({ "result": result });
                     if !was_complete && let Some(follow_ups) = released_follow_ups(state) {
                         response["followUps"] = follow_ups.into();
                     }
@@ -1031,7 +1048,6 @@ fn tool_response(state: &mut RuntimeState, call: &GeminiFunctionCall) -> serde_j
                     // note on Coding is not a new gap, and asking again on
                     // every one would push the model toward inventing the
                     // earlier steps to make the reminder stop.
-                    let phase = phase_id(evidence.phase);
                     let newly_shown = !shown_before.contains(&phase)
                         && framework_progress(state).contains(&phase);
                     if newly_shown
@@ -1093,14 +1109,38 @@ fn tool_response(state: &mut RuntimeState, call: &GeminiFunctionCall) -> serde_j
     }
 }
 
-/// Whether the candidate's checklist would look any different now.
+/// The checklist the page has not been shown yet, if any.
 ///
-/// The tool is idempotent and returns the existing entry for a repeat, and
-/// evidence for a phase they never reached is recorded but never shown. Asking
-/// how much has been recorded instead would redraw the checklist with nothing
-/// new in it, and reveal an empty one for a skip banked before any phase was.
-fn checklist_changed(shown_before: &[&'static str], state: &RuntimeState) -> bool {
-    framework_progress(state) != shown_before
+/// Compared with what the page was last told rather than with the state
+/// before one event, so a publish that failed is retried instead of waiting for
+/// another phase to change, and a rejoined page, whose list starts empty, is
+/// told again. The tool is idempotent and returns the existing entry for a
+/// repeat, and evidence for a phase they never reached is recorded but never
+/// shown, so asking how much has been recorded instead would redraw the
+/// checklist with nothing new in it, and reveal an empty one for a skip banked
+/// before any phase was.
+pub(super) fn framework_progress_unpublished(state: &RuntimeState) -> Option<Vec<&'static str>> {
+    let phases = framework_progress(state);
+    (phases != state.framework_published).then_some(phases)
+}
+
+/// Tells the page what `framework_progress_unpublished` holds, if anything.
+/// Not `?`: a checklist that failed to reach the page is retried on the next
+/// watch tick, and is no reason to end the interview.
+///
+/// Called where evidence can change, after tool calls and data packets, and
+/// on the watch tick for a judgment collected, a rejoined page or a retry; not
+/// on every turn of the room loop, which runs for every audio frame.
+pub(super) async fn flush_framework_progress(room: &Room, state: &mut RuntimeState) {
+    let Some(phases) = framework_progress_unpublished(state) else {
+        return;
+    };
+    match publish_framework_progress(room, &phases).await {
+        Ok(()) => state.framework_published = phases,
+        Err(error) => {
+            eprintln!("Framework progress publish failed ({error}); retrying on the next tick");
+        }
+    }
 }
 
 /// What the candidate is allowed to see of their own framework progress: which
@@ -1111,14 +1151,14 @@ fn checklist_changed(shown_before: &[&'static str], state: &RuntimeState) -> boo
 /// server-side, because those are the reading rather than the fact.
 async fn publish_framework_progress(
     room: &Room,
-    state: &RuntimeState,
+    phases: &[&'static str],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     room.local_participant()
         .publish_data(browser_packet(
             TOPIC_CONTROL,
             &serde_json::json!({
                 "type": "framework_state",
-                "phases": framework_progress(state),
+                "phases": phases,
             }),
         )?)
         .await?;

@@ -162,7 +162,7 @@ fn bootstrap_preserves_python_gemini_defaults_and_prompts() {
     assert!(
         bootstrap
             .instructions
-            .contains("`read_editor`: only for code")
+            .contains("`read_editor`: to check recorded phases")
     );
     assert!(
         bootstrap

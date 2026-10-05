@@ -1228,25 +1228,83 @@ async fn generate_interim_review_at(
     prompt: &str,
     scope: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let request = content_request(
+        &crate::agent::interim_system_instruction(),
+        prompt,
+        interim_generation_config(),
+    );
+    side_call_once(keys, url, &request, "interim", scope, true).await
+}
+
+/// One attempt at a side call on the report keys: the interim review or the
+/// phase judge, which differ only in the request, the label and whether a rate
+/// limit cools the key.
+async fn side_call_once(
+    keys: &GeminiKeys,
+    url: &str,
+    request: &Value,
+    surface: &str,
+    scope: &str,
+    cool_on_quota: bool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let api_key = keys.select_report()?;
     let result = generate_content_once(
         &api_key,
         url,
-        &content_request(
-            &crate::agent::interim_system_instruction(),
-            prompt,
-            interim_generation_config(),
-        ),
+        request,
         INTERIM_ATTEMPT_TIMEOUT,
-        &http_usage_label("interim", scope, 1, 0),
+        &http_usage_label(surface, scope, 1, 0),
     )
     .await;
     if let Err(error) = &result
         && let Some(failure) = credential_failure(error.as_ref())
+        && (cool_on_quota || failure != CredentialFailure::Quota)
     {
         keys.failed(&api_key, failure, ApiSurface::Report);
     }
     result
+}
+
+/// The phase judge: one attempt, like the interim review and for the same
+/// reasons. A call that fails ticks nothing, and the next candidate turn asks
+/// again over the same transcript tail.
+pub(crate) async fn generate_phase_judgment_with_keys(
+    keys: &GeminiKeys,
+    model: &str,
+    prompt: &str,
+    scope: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    generate_phase_judgment_at(keys, &gemini_generate_content_url(model), prompt, scope).await
+}
+
+async fn generate_phase_judgment_at(
+    keys: &GeminiKeys,
+    url: &str,
+    prompt: &str,
+    scope: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let request = content_request(
+        &crate::agent::phase_judge_system_instruction(),
+        prompt,
+        phase_judge_generation_config(),
+    );
+
+    // A rate limit is not reported against the key. Cooling it would take the
+    // key off the report surface for every room in this process, and the judge,
+    // which may run dozens of times an interview, would then be what left a
+    // final report without a key. The next judgment simply asks again.
+    side_call_once(keys, url, &request, "phase", scope, false).await
+}
+
+/// Deterministic, and JSON: the answer is read by the server, not a person.
+fn phase_judge_generation_config() -> Value {
+    json!({
+        "responseMimeType": "application/json",
+        "maxOutputTokens": 1024,
+        "thinkingConfig": { "thinkingBudget": 0 },
+        "temperature": 0.0,
+        "seed": GENERATION_SEED
+    })
 }
 
 /// The seed both HTTP calls sample with. Measured against the report model at
@@ -1564,7 +1622,7 @@ pub fn live_tool_declarations(interview_loop: crate::agent::InterviewLoop) -> Va
     let mut tools = vec![
         json!({
             "name": TOOL_READ_EDITOR,
-            "description": "The editor's language and numbered code, the latest test run and the minutes left. Read only code the current question needs that no event or tool answer has shown you; start at a known relevant line rather than refilling the whole editor.",
+            "description": "The recorded framework phases, editor's language and numbered code, latest test run and minutes left. Read to check whether a step is marked, or for code the current question needs that no event or tool answer has shown you; start at a known relevant line rather than refilling the whole editor.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {

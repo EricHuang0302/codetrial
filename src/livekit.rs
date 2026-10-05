@@ -87,7 +87,7 @@ const CANDIDATE_ABSENCE_LIMIT: Duration = Duration::from_secs(90);
 
 use crate::gemini::{
     GeminiEvent, GeminiKeys, GeminiLiveSession, generate_interim_review_with_keys,
-    live_session_with_keys,
+    generate_phase_judgment_with_keys, live_session_with_keys,
 };
 use crate::runtime::{AGENT_NAME, RuntimeBootstrap, agent_identity};
 use crate::token::{LivekitTokenInput, livekit_token};
@@ -1085,29 +1085,184 @@ fn spawn_interim_review(
     interview: InterviewContext<'_>,
 ) -> tokio::task::JoinHandle<String> {
     let prompt = take_interim_review_window(state, interview.boot);
+    spawn_side_call(SideCallKind::SideCall, prompt, interview)
+}
+
+/// Which side call `spawn_side_call` makes. Its label opens the log line a
+/// failed call leaves, which `scripts/analyze-gemini-usage.py` counts.
+#[derive(Clone, Copy)]
+enum SideCallKind {
+    SideCall,
+    PhaseJudge,
+}
+
+/// Starts one side call on the report keys, answered with nothing when it
+/// fails: logged, and never the candidate's problem. An empty interim note
+/// records nothing, and an empty judgment ticks nothing; the next pause or
+/// turn asks again.
+fn spawn_side_call(
+    kind: SideCallKind,
+    prompt: String,
+    interview: InterviewContext<'_>,
+) -> tokio::task::JoinHandle<String> {
     let keys = Arc::clone(interview.keys);
     let model = interview.boot.report_model.to_string();
     let room_name = interview.boot.room_name.to_string();
     tokio::spawn(async move {
-        match generate_interim_review_with_keys(&keys, &model, &prompt, &room_name).await {
-            Ok(text) => text,
-
-            // Logged and answered with nothing. This is an optimization on a
-            // report that will be written from the transcript regardless, so an
-            // outage here is not the candidate's problem and must never become
-            // one. An empty note records nothing.
-            Err(error) => {
-                eprintln!(
-                    "interim review skipped room={room_name}: {}",
-                    keys.redact(&error.to_string())
-                );
-                String::new()
-            }
-        }
+        let (label, result) = match kind {
+            SideCallKind::SideCall => (
+                "interim review",
+                generate_interim_review_with_keys(&keys, &model, &prompt, &room_name).await,
+            ),
+            SideCallKind::PhaseJudge => (
+                "phase judge",
+                generate_phase_judgment_with_keys(&keys, &model, &prompt, &room_name).await,
+            ),
+        };
+        result.unwrap_or_else(|error| {
+            eprintln!(
+                "{label} skipped room={room_name}: {}",
+                keys.redact(&error.to_string())
+            );
+            String::new()
+        })
     })
 }
 
-/// The one review that may be in flight, owned rather than let loose.
+/// How long the end of the interview waits for the phase judge in all, and
+/// how long a round transition is held for it. Less than the call's own
+/// deadline: the candidate is waiting on the report or on the next question.
+const PHASE_JUDGE_SETTLE: Duration = Duration::from_secs(5);
+
+/// Reads the latest stretch for REACTO steps the interviewer has not recorded,
+/// off to one side like the interim review. Collected on a later watch tick.
+fn spawn_phase_judge(
+    state: &mut RuntimeState,
+    interview: InterviewContext<'_>,
+) -> tokio::task::JoinHandle<String> {
+    let prompt = crate::agent::take_phase_judge_window(state, interview.boot.problem);
+    spawn_side_call(SideCallKind::PhaseJudge, prompt, interview)
+}
+
+/// Applies a finished judgment, logs what it recorded the way the
+/// interviewer's own evidence calls are logged, and tells the interviewer.
+async fn collect_phase_judgment(context: &mut GeminiEventContext<'_>, text: &str, room_name: &str) {
+    let was_complete = crate::agent::coding_round_complete(context.state);
+    let recorded = crate::agent::apply_phase_judgment(context.state, text);
+    for evidence in &recorded {
+        eprintln!(
+            "evidence: at={} phase={} accepted=true source=phase_judge room={room_name}",
+            log_clock(context.state),
+            crate::agent::phase_id(evidence.phase),
+        );
+    }
+    if recorded.is_empty() || context.state.ended {
+        return;
+    }
+    let note = crate::agent::phase_judgment_note(context.state, &recorded, was_complete);
+    if let Err(error) = send_model_context(
+        context.gemini,
+        context.state,
+        ModelInputKind::Turn,
+        &note,
+        None,
+    )
+    .await
+    {
+        // A replacement socket's cold briefing carries the recorded steps and
+        // any released follow-ups, so nothing here is owed.
+        eprintln!("Gemini phase note failed ({error}); waiting for the close to be reported");
+    }
+}
+
+/// Waits for one judgment until `deadline`, collecting it if it lands and
+/// aborting it if it does not.
+async fn await_phase_judgment(
+    context: &mut GeminiEventContext<'_>,
+    interview: InterviewContext<'_>,
+    mut judgment: tokio::task::JoinHandle<String>,
+    deadline: Instant,
+) {
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut judgment).await {
+        Ok(finished) => finish_phase_judgment(context, interview, finished).await,
+        Err(_) => judgment.abort(),
+    }
+}
+
+/// A judgment that has ended, however it ended: applied if it returned, and
+/// otherwise a judgment that did not happen.
+async fn finish_phase_judgment(
+    context: &mut GeminiEventContext<'_>,
+    interview: InterviewContext<'_>,
+    finished: Result<String, tokio::task::JoinError>,
+) {
+    match finished {
+        Ok(text) => collect_phase_judgment(context, &text, interview.boot.room_name).await,
+        Err(error) => {
+            eprintln!("phase judge ended abnormally: {error}");
+
+            // Answered with nothing, as a failed call is, so its window is read
+            // again.
+            crate::agent::apply_phase_judgment(context.state, "");
+        }
+    }
+}
+
+/// Brings the judged steps up to date before the end, after which the report
+/// is written from the evidence. The judgment in flight is waited for, then
+/// one more is asked for anything said since, within one shared bound.
+///
+/// Only the end waits in the room loop. Waiting stops the loop forwarding the
+/// candidate's audio, whose queue holds about a tenth of a second, so anything
+/// said meanwhile never reaches the interviewer; at the end nothing more is
+/// owed a reply, but the round transition is held instead, see
+/// `defers_round_transition`.
+async fn settle_phase_judge(context: &mut GeminiEventContext<'_>, interview: InterviewContext<'_>) {
+    let deadline = Instant::now() + PHASE_JUDGE_SETTLE;
+    if let Some(judgment) = context.activity.phase_judge.take() {
+        await_phase_judgment(context, interview, judgment, deadline).await;
+    }
+    if crate::agent::phase_judge_due(context.state)
+        && Instant::now() < deadline
+        && context.activity.reserve_phase_judge(Instant::now())
+    {
+        let judgment = spawn_phase_judge(context.state, interview);
+        await_phase_judgment(context, interview, judgment, deadline).await;
+    }
+}
+
+/// Whether a control packet is the end, which `settle_phase_judge` runs before.
+fn settles_phase_judge(state: &RuntimeState, topic: &str, payload: &serde_json::Value) -> bool {
+    !state.ended && control_type(topic, payload) == Some("end_interview")
+}
+
+/// The `type` of a control packet, or none for any other topic.
+fn control_type<'a>(topic: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
+    (topic == TOPIC_CONTROL)
+        .then(|| payload.get("type").and_then(serde_json::Value::as_str))
+        .flatten()
+}
+
+/// Whether a round transition must wait for the phase judge. The transition
+/// skips the behavioral round for an incomplete coding round and cannot be
+/// taken back, so a judgment that may complete it, in flight or due for what
+/// was just said, is let finish first. The packet is held rather than waited
+/// on, and the watch tick applies it once the judgment is in or the hold runs
+/// out; see `RuntimeActivity::parked_transition_ready`.
+fn defers_round_transition(
+    state: &RuntimeState,
+    judge_running: bool,
+    topic: &str,
+    payload: &serde_json::Value,
+) -> bool {
+    crate::agent::round_transition_due(state, payload)
+        && !state.behavioral_round_started
+        && control_type(topic, payload) == Some("round_transition")
+        && (judge_running || crate::agent::phase_judge_due(state))
+}
+
+/// The one side call of a kind that may be in flight, an interim review or a
+/// phase judgment, owned rather than let loose.
 ///
 /// Two things a bare `tokio::spawn` got wrong. A task that panics sends no
 /// result, so a loop tracking "a review is running" in a bool would believe one
@@ -1118,9 +1273,9 @@ fn spawn_interim_review(
 /// was reading any more. `run_room` has several exits and none of them should
 /// have to remember this, so the abort is the drop.
 #[derive(Default)]
-struct InterimReview(Option<tokio::task::JoinHandle<String>>);
+struct SideCall(Option<tokio::task::JoinHandle<String>>);
 
-impl InterimReview {
+impl SideCall {
     fn is_running(&self) -> bool {
         self.0.is_some()
     }
@@ -1138,6 +1293,11 @@ impl InterimReview {
         }
     }
 
+    /// The handle, finished or not, leaving the slot empty.
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<String>> {
+        self.0.take()
+    }
+
     fn start(&mut self, handle: tokio::task::JoinHandle<String>) {
         if let Some(replaced) = self.0.replace(handle) {
             replaced.abort();
@@ -1145,7 +1305,7 @@ impl InterimReview {
     }
 }
 
-impl Drop for InterimReview {
+impl Drop for SideCall {
     fn drop(&mut self) {
         if let Some(handle) = self.0.take() {
             handle.abort();
@@ -1385,7 +1545,7 @@ struct RoomLoop {
     /// At most one idle-window review at a time, collected on the watch tick.
     /// A tick of latency on a note nobody is waiting for is not worth an arm
     /// in the select.
-    interim_review: InterimReview,
+    interim_review: SideCall,
 
     /// Checked on the watch tick rather than given its own timer arm: the tick
     /// already runs, and a resolution of one tick is plenty for a ninety-second
@@ -1573,6 +1733,44 @@ async fn on_watch_tick(
     // already ended the reader, so the close it found is reported next.
     if let Err(error) = context.gemini.keep_alive().await {
         eprintln!("Gemini ping failed ({error}); waiting for the close to be reported");
+    }
+
+    if let Some(judgment) = context.activity.phase_judge.finished() {
+        finish_phase_judgment(context, interview, judgment.await).await;
+    }
+    let judge_due = crate::agent::phase_judge_due(context.state);
+    if context
+        .activity
+        .held_transition_needs_judgment(tick_at, judge_due)
+        && context.activity.reserve_phase_judge(tick_at)
+    {
+        let judgment = spawn_phase_judge(context.state, interview);
+        context.activity.phase_judge.start(judgment);
+    }
+    if context.activity.parked_transition_ready(tick_at, judge_due)
+        && let Some(parked) = context.activity.pending_round_transition.take()
+        && apply_data_packet(
+            room,
+            context,
+            interview,
+            TOPIC_CONTROL,
+            &parked.payload,
+            parked.received,
+        )
+        .await?
+        .is_break()
+    {
+        return Ok(ControlFlow::Break(()));
+    }
+
+    // A judgment collected above, a page that rejoined, or a publish that
+    // failed: the tick is where all three reach the page.
+    session::flush_framework_progress(room, context.state).await;
+    if !context.activity.phase_judge.is_running()
+        && context.activity.claim_phase_judge(context.state, tick_at)
+    {
+        let judge = spawn_phase_judge(context.state, interview);
+        context.activity.phase_judge.start(judge);
     }
 
     if let Some(review) = loops.interim_review.finished() {
@@ -2128,7 +2326,7 @@ pub(crate) async fn run_room_with_slot(
         restarts,
         deferred_restart: DeferredRestart::default(),
         resume_recovery: ResumeRecovery::default(),
-        interim_review: InterimReview::default(),
+        interim_review: SideCall::default(),
         presence: CandidatePresence::default(),
     };
 
@@ -2404,6 +2602,8 @@ async fn handle_room_event(
         {
             presence.returned();
             context.state.announce_thinking();
+            // A rejoined page starts with an empty checklist.
+            context.state.framework_published.clear();
         }
         _ => {}
     }
@@ -2811,7 +3011,7 @@ async fn end_through_control(
     context: &mut GeminiEventContext<'_>,
     interview: InterviewContext<'_>,
     reason: &str,
-    review: &mut InterimReview,
+    review: &mut SideCall,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A review that came back between two watch ticks is a pause already paid
     // for, and the report is about to be written. Collected here rather than
@@ -2844,7 +3044,43 @@ async fn handle_data_packet(
     payload: &serde_json::Value,
     received: bool,
 ) -> Result<ControlFlow<()>, Box<dyn std::error::Error + Send + Sync>> {
+    if settles_phase_judge(context.state, topic, payload) {
+        settle_phase_judge(context, interview).await;
+    }
+    let judge_running = context.activity.phase_judge.is_running();
+    if defers_round_transition(context.state, judge_running, topic, payload)
+        && (judge_running || context.activity.reserve_phase_judge(Instant::now()))
+    {
+        if !judge_running {
+            let judgment = spawn_phase_judge(context.state, interview);
+            context.activity.phase_judge.start(judgment);
+        }
+        // A repeat of the same request keeps the first one's hold.
+        context
+            .activity
+            .pending_round_transition
+            .get_or_insert_with(|| ParkedPacket {
+                payload: payload.clone(),
+                received,
+                deadline: Instant::now() + PHASE_JUDGE_SETTLE,
+            });
+        return Ok(ControlFlow::Continue(()));
+    }
+    apply_data_packet(room, context, interview, topic, payload, received).await
+}
+
+/// Applies a packet after any judgment wait has been settled. Released round
+/// transitions enter here so new speech or a slow judge cannot renew the hold.
+async fn apply_data_packet(
+    room: &Room,
+    context: &mut GeminiEventContext<'_>,
+    interview: InterviewContext<'_>,
+    topic: &str,
+    payload: &serde_json::Value,
+    received: bool,
+) -> Result<ControlFlow<()>, Box<dyn std::error::Error + Send + Sync>> {
     let resume_debt = ResumeDebt::capture(context.state);
+
     // One reading per packet, shared by every entry the packet produces.
     let receipt_timestamp_ms = crate::current_epoch_millis();
     let packet_at = Instant::now();
@@ -2878,6 +3114,10 @@ async fn handle_data_packet(
     context
         .activity
         .settle_thinking_request(was_requested, context.state, &result);
+
+    // Before the reply goes to the model, so a tick the packet earned reaches
+    // the page without waiting on that write.
+    session::flush_framework_progress(room, context.state).await;
     let mut reply = result.generate_reply.take();
     let grace = thinking_transcript_grace(interview.boot.silence_ms);
     let effects = settle_hold(context, &result, &mut reply, packet_at, grace).await;
@@ -2891,9 +3131,13 @@ async fn handle_data_packet(
     if effects.abandoned {
         reply = None;
     }
+
+    // Whether what this packet asked the model to read reached it, which is
+    // what settles a reminder of open earlier steps written into it.
+    let mut delivered = false;
     if let Some(held) = result.held_context.take() {
         let held = crate::agent::with_timer(context.state, held);
-        if let Err(error) = send_model_context(
+        match send_model_context(
             context.gemini,
             context.state,
             ModelInputKind::Turn,
@@ -2902,7 +3146,10 @@ async fn handle_data_packet(
         )
         .await
         {
-            eprintln!("Gemini held context failed ({error}); waiting for the close to be reported");
+            Ok(()) => delivered = true,
+            Err(error) => eprintln!(
+                "Gemini held context failed ({error}); waiting for the close to be reported"
+            ),
         }
     }
     if let Some(paused) = result.pause_changed {
@@ -2973,6 +3220,7 @@ async fn handle_data_packet(
             Instant::now(),
         ) {
             Ok(()) => {
+                delivered = true;
                 if result.carries_thinking_debt {
                     context.state.clear_thinking_debt();
                 }
@@ -3005,12 +3253,14 @@ async fn handle_data_packet(
             }
         }
     }
+    context.state.settle_earlier_steps(delivered);
     let Some(reason) = result.finish_interview else {
         return Ok(ControlFlow::Continue(()));
     };
     if let Some(slot) = interview.slot {
         slot.assessment_finished();
     }
+
     session::flush_thinking_notice(room, context.state).await;
 
     // The assessment ends here, before the goodbye: the reducer has closed the

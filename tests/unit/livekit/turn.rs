@@ -266,7 +266,7 @@ fn one_review_at_a_time_is_arithmetic_and_not_a_hope() {
     use crate::gemini::INTERIM_ATTEMPT_TIMEOUT;
 
     // A call cannot outlive the wait for the next chance to start one. This is
-    // what makes the slot in `InterimReview` unable to be occupied when a pause
+    // what makes the slot in `SideCall` unable to be occupied when a pause
     // comes due, so the two mechanisms cannot disagree about whether a review
     // is running.
     const { assert!(INTERIM_ATTEMPT_TIMEOUT.as_secs() < INTERIM_COOLDOWN.as_secs()) };
@@ -1443,4 +1443,54 @@ fn a_replacement_socket_has_to_transcribe_the_candidate_again() {
     activity.reset_context_observations(true);
     activity.note_candidate_voice(start + Duration::from_secs(9));
     assert_eq!(activity.last_user_speech, start + Duration::from_secs(9));
+}
+
+/// The phase judge follows the answer that earned a tick within seconds, not
+/// the interim review's minutes: it waits only for the candidate to stop
+/// talking and typing, and for its own short cooldown. It does not wait for the
+/// floor, since it takes no turn. It spends nothing when nothing new was said
+/// or every step it records is closed, and it stops at its ceiling.
+#[test]
+fn the_phase_judge_follows_a_candidate_turn_within_seconds() {
+    let start = Instant::now();
+    let spoke = || RuntimeState {
+        transcript: vec!["Candidate: so I merge the overlapping intervals".to_string()],
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(start);
+    activity.floor = Floor::Speaking;
+    assert!(
+        !activity.claim_phase_judge(&spoke(), start + PHASE_JUDGE_IDLE / 2),
+        "the candidate may still be talking"
+    );
+    let idle = start + PHASE_JUDGE_IDLE;
+    assert!(
+        !activity.claim_phase_judge(&RuntimeState::default(), idle),
+        "nothing said, nothing to judge"
+    );
+    assert!(
+        activity.claim_phase_judge(&spoke(), idle),
+        "the interviewer speaking does not hold it back"
+    );
+    assert!(
+        !activity.claim_phase_judge(&spoke(), idle + PHASE_JUDGE_COOLDOWN / 2),
+        "the cooldown is stamped where it is read"
+    );
+    assert!(activity.claim_phase_judge(&spoke(), idle + PHASE_JUDGE_COOLDOWN));
+
+    let mut paused = spoke();
+    paused.paused = true;
+    assert!(!activity.claim_phase_judge(&paused, idle + PHASE_JUDGE_COOLDOWN * 3));
+
+    activity.phase_judges = MAX_PHASE_JUDGES;
+    assert!(
+        !activity.claim_phase_judge(&spoke(), idle + PHASE_JUDGE_COOLDOWN * 4),
+        "past the ceiling the interviewer's own calls remain"
+    );
+    assert!(!activity.reserve_phase_judge(idle));
+    activity.phase_judges = MAX_PHASE_JUDGES - 1;
+    assert!(activity.reserve_phase_judge(idle));
+    assert_eq!(activity.phase_judges, MAX_PHASE_JUDGES);
+    assert_eq!(activity.last_phase_judge, Some(idle));
+    assert!(!activity.reserve_phase_judge(idle + PHASE_JUDGE_COOLDOWN));
 }

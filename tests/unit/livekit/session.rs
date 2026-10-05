@@ -7,7 +7,7 @@
 //! integration one.
 
 use super::*;
-use crate::agent::ThinkingHold;
+use crate::agent::{ThinkingHold, record_framework_evidence};
 
 // The room half's test module owns the audio fixture, because the room half
 // owns the track it is a stand-in for.
@@ -83,7 +83,7 @@ fn the_checklist_is_republished_only_when_it_would_look_different() {
     // And the rule the publish is keyed on, which the assertion above cannot
     // see: same phases means no redraw, a new phase means one.
     assert!(
-        !checklist_changed(&shown_before, &state),
+        framework_progress_unpublished(&state).is_none(),
         "a skip leaves the checklist looking exactly as it did"
     );
     record_framework_evidence(
@@ -97,9 +97,48 @@ fn the_checklist_is_republished_only_when_it_would_look_different() {
         }),
     )
     .expect("evidence should record");
-    assert!(
-        checklist_changed(&shown_before, &state),
+    assert_eq!(
+        framework_progress_unpublished(&state),
+        Some(vec!["repeat"]),
         "a phase the candidate reached is a new tick and has to be sent"
+    );
+}
+
+/// The publish gate compares with what the page was last told, not with the
+/// state before one event: a send that failed leaves the tick unpublished, so
+/// the next watch tick retries it rather than waiting for another phase to
+/// change.
+/// A rejoined page starts empty and is told the list again, but an empty list
+/// is still never sent to it.
+#[test]
+fn an_unpublished_checklist_is_retried_and_resent_to_a_rejoined_page() {
+    let mut state = RuntimeState::default();
+    assert!(
+        framework_progress_unpublished(&state).is_none(),
+        "a rejoined page with nothing ticked is not shown an empty list"
+    );
+    record_framework_evidence(
+        &mut state,
+        &serde_json::json!({"phase": "repeat", "source": "candidate_speech",
+            "kind": "observed", "confidence": 80, "summary": "Restated it."}),
+    )
+    .unwrap();
+
+    // A failed send leaves `framework_published` where it was.
+    assert_eq!(framework_progress_unpublished(&state), Some(vec!["repeat"]));
+    assert_eq!(
+        framework_progress_unpublished(&state),
+        Some(vec!["repeat"]),
+        "still owed after the failure, with no new phase"
+    );
+
+    state.framework_published = vec!["repeat"];
+    assert!(framework_progress_unpublished(&state).is_none());
+    state.framework_published.clear();
+    assert_eq!(
+        framework_progress_unpublished(&state),
+        Some(vec!["repeat"]),
+        "the candidate rejoined, so the page is told again"
     );
 }
 /// A pause silences output for as long as it lasts, and nothing about the
@@ -846,6 +885,9 @@ fn evidence_reply_names_the_earlier_steps_still_open() {
         ..RuntimeState::default()
     };
     receive_test_run(&mut state);
+    // The run's own reaction named the open steps; start from none named.
+    state.settle_earlier_steps(false);
+    state.earlier_steps_named.clear();
     state.behavioral_round_started = true;
     let mut record = |phase: &str, kind: &str, source: &str, summary: &str| {
         execute_tool_call(
@@ -889,8 +931,13 @@ fn evidence_reply_names_the_earlier_steps_still_open() {
 
     // Algorithm is still open, but Coding already named it: the candidate may
     // have skipped it, and asking again leaves inventing it as the only answer.
+    // The run already ticked Test, so the model's call adds nothing.
     let test = record("test", "observed", "test_event", "Predicted and ran [].");
-    assert_eq!(test["result"], "Recorded test.", "{test}");
+    assert_eq!(
+        test["result"],
+        "Test was already recorded by the platform when the run arrived; nothing was added.",
+        "{test}"
+    );
     assert!(test.get("earlierSteps").is_none(), "{test}");
 
     // A skip ticks nothing, so it has no gap to report, even with Situation and
@@ -1002,7 +1049,7 @@ fn oral_test_trace_cannot_end_the_interview_before_execution() {
     let run = serde_json::json!({"passed": 1, "total": 2,
         "code": state.code, "language": state.language});
     crate::agent::apply_data_event(&mut state, crate::runtime::TOPIC_TEST_RESULTS, &run, 99.0);
-    assert!(!crate::agent::framework_progress(&state).contains(&"test"));
+    assert!(crate::agent::framework_progress(&state).contains(&"test"));
     assert!(
         execute_tool_call(&mut state, &evidence("test", "candidate_speech"))
             .get("error")
@@ -1396,4 +1443,155 @@ fn a_turn_end_settles_a_requested_hold() {
     activity.note_candidate_finished(start, false);
     settle_hold_at_turn_end(&mut state, &mut activity);
     assert!(activity.reply_in_flight());
+}
+
+#[test]
+fn tool_answers_expose_the_recorded_checklist_even_after_refusal() {
+    let mut state = RuntimeState::default();
+    let read = GeminiFunctionCall {
+        id: "read".into(),
+        name: TOOL_READ_EDITOR.into(),
+        args: serde_json::json!({}),
+    };
+    assert_eq!(
+        execute_tool_call(&mut state, &read)["frameworkState"]["phases"],
+        serde_json::json!([])
+    );
+    let call = |phase: &str| GeminiFunctionCall {
+        id: phase.into(),
+        name: TOOL_RECORD_FRAMEWORK_EVIDENCE.into(),
+        args: serde_json::json!({"phase": phase, "source": "candidate_speech", "kind": "observed", "confidence": 90, "summary": "Restated inputs and expected output."}),
+    };
+    let accepted = execute_tool_call(&mut state, &call("repeat"));
+    assert!(accepted.get("error").is_none());
+    assert_eq!(
+        accepted["frameworkState"]["phases"],
+        serde_json::json!(["repeat"])
+    );
+    let refused = execute_tool_call(&mut state, &call("test"));
+    assert!(refused.get("error").is_some());
+    assert_eq!(
+        refused["frameworkState"]["phases"],
+        serde_json::json!(["repeat"])
+    );
+    assert_eq!(
+        execute_tool_call(&mut state, &read)["frameworkState"]["phases"],
+        serde_json::json!(framework_progress(&state))
+    );
+}
+
+#[test]
+fn a_received_test_changes_the_packet_checklist_publication_gate_once() {
+    let mut state = RuntimeState {
+        code: "def solve(nums):\n    return sorted(nums)\n".into(),
+        ..RuntimeState::default()
+    };
+    let packet = serde_json::json!({"code": state.code, "language": state.language, "passed": 0, "total": 2});
+    crate::agent::apply_data_event(&mut state, crate::runtime::TOPIC_TEST_RESULTS, &packet, 0.0);
+    assert_eq!(framework_progress_unpublished(&state), Some(vec!["test"]));
+    assert_eq!(framework_progress(&state), ["test"]);
+    state.framework_published = vec!["test"];
+    let received = state.framework_evidence[0].clone();
+    let call = GeminiFunctionCall {
+        id: "late".into(),
+        name: TOOL_RECORD_FRAMEWORK_EVIDENCE.into(),
+        args: serde_json::json!({"phase": "test", "source": "test_event", "kind": "inferred", "confidence": 60, "summary": "A delayed model claim about testing."}),
+    };
+    let late = execute_tool_call(&mut state, &call);
+    assert!(late.get("error").is_none(), "{late}");
+
+    // The note was dropped, so the model is not told it landed.
+    let result = late["result"].as_str().unwrap();
+    assert!(
+        result.contains("already recorded by the platform"),
+        "{result}"
+    );
+    assert!(result.contains("nothing was added"), "{result}");
+    assert!(!result.starts_with("Recorded"), "{result}");
+    assert_eq!(state.framework_evidence, [received]);
+    assert!(framework_progress_unpublished(&state).is_none());
+    crate::agent::apply_data_event(&mut state, crate::runtime::TOPIC_TEST_RESULTS, &packet, 0.0);
+    assert!(framework_progress_unpublished(&state).is_none());
+    assert_eq!(state.framework_evidence.len(), 1);
+}
+
+#[test]
+fn a_late_model_test_call_retains_historical_credit_after_a_large_edit() {
+    let mut state = RuntimeState {
+        code: "def solve(nums):\n    return sorted(nums)\n".into(),
+        ..RuntimeState::default()
+    };
+    receive_test_run(&mut state);
+    let received = state.framework_evidence[0].clone();
+    let buffers = [
+        "def solve(nums):\n    if not nums: return []\n    return sorted(nums, reverse=True)\n",
+        "def solve(nums):\n    pass\n",
+        "",
+    ];
+    state
+        .code_templates
+        .insert(state.language.clone(), buffers[1].to_string());
+    let call = GeminiFunctionCall {
+        id: "late".into(),
+        name: TOOL_RECORD_FRAMEWORK_EVIDENCE.into(),
+        args: serde_json::json!({"phase": "test", "source": "test_event", "kind": "observed", "confidence": 90, "summary": "A delayed duplicate after the edit."}),
+    };
+    for code in buffers {
+        state.code = code.to_string();
+        let result = execute_tool_call(&mut state, &call);
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(
+            state.framework_evidence.as_slice(),
+            std::slice::from_ref(&received)
+        );
+        assert!(!result.to_string().contains("click Run"));
+        assert_eq!(
+            result["frameworkState"]["phases"],
+            serde_json::json!(["test"])
+        );
+    }
+}
+
+/// A reminder of open earlier steps counts as given only once the reply that
+/// carries it is delivered: a lost one leaves the steps to be named again, and
+/// until it is settled the same steps are not named twice.
+#[test]
+fn an_undelivered_reminder_leaves_its_steps_to_be_named_again() {
+    let mut state = RuntimeState {
+        code: "def solve(nums):\n    return sorted(nums)\n".to_string(),
+        ..RuntimeState::default()
+    };
+    let coding = |state: &mut RuntimeState, summary: &str| {
+        execute_tool_call(
+            state,
+            &GeminiFunctionCall {
+                id: "1".to_string(),
+                name: TOOL_RECORD_FRAMEWORK_EVIDENCE.to_string(),
+                args: serde_json::json!({"phase": "coding", "source": "editor_snapshot",
+                    "kind": "observed", "confidence": 90, "summary": summary}),
+            },
+        )
+    };
+    assert!(coding(&mut state, "Wrote a sort.")["earlierSteps"].is_string());
+    assert_eq!(
+        state.earlier_steps_pending,
+        ["repeat", "example", "algorithm"]
+    );
+    assert!(state.earlier_steps_named.is_empty());
+
+    // Lost: nothing is named, so the steps may be named again.
+    state.settle_earlier_steps(false);
+    assert!(state.earlier_steps_pending.is_empty());
+    assert!(state.earlier_steps_named.is_empty());
+    let evidence = state.framework_evidence[0].clone();
+    let reminder = crate::agent::unrecorded_earlier_phases(&mut state, &evidence);
+    assert!(reminder.is_some_and(|text| text.contains("repeat, example, algorithm")));
+
+    // Delivered: named once, and not again.
+    state.settle_earlier_steps(true);
+    assert_eq!(
+        state.earlier_steps_named,
+        ["repeat", "example", "algorithm"]
+    );
+    assert!(crate::agent::unrecorded_earlier_phases(&mut state, &evidence).is_none());
 }

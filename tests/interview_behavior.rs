@@ -19,8 +19,9 @@
 
 use codetrial::agent::{
     InterviewGrounding, InterviewLoop, InterviewProfile, Problem, RuntimeState,
-    build_instructions_for_plan, find_problem, get_problem, greeting, log_hint_text,
-    names_published_problem,
+    apply_phase_judgment, build_instructions_for_plan, find_problem, framework_progress,
+    get_problem, greeting, log_hint_text, names_published_problem, phase_judge_system_instruction,
+    take_phase_judge_window,
 };
 use codetrial::gemini::{GeminiFunctionCall, live_tool_declarations};
 use codetrial::livekit::execute_tool_call;
@@ -1490,5 +1491,138 @@ async fn played_candidates_are_held_to_the_same_rules() {
         "{} behaviour failures:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// Exercise the model's decision, not a scripted evidence call. This text
+/// proxy cannot establish that the native-audio model follows the same rule.
+#[tokio::test]
+#[ignore = "needs a model and makes requests; run with --ignored"]
+async fn conversational_reacto_answers_are_recorded_in_the_same_reply() {
+    let problem = get_problem(Some("two-sum"));
+    let mut conversation = Conversation {
+        client: reqwest::Client::new(),
+        backend: Backend::from_env(),
+        instructions: build_instructions_for_plan(
+            problem,
+            45,
+            &InterviewProfile::default(),
+            &InterviewGrounding::default(),
+            InterviewLoop::CodingOnly,
+            false,
+        ),
+        contents: vec![
+            json!({"role": "user", "parts": [{"text": "I choose Python."}]}),
+            json!({"role": "model", "parts": [{"text": "Please restate the inputs, output and matching rule in your own words."}]}),
+        ],
+        state: RuntimeState::for_problem(problem),
+    };
+    for (phase, answer) in [
+        (
+            "repeat",
+            "The input is a list of amounts and a target. I return two distinct zero-based indices whose amounts sum to the target, not the amounts themselves. There is exactly one pair, and I cannot reuse an entry.",
+        ),
+        (
+            "example",
+            "For [2,7,11,15] and target 9, I return [0,1] because 2+7=9. For [3,3] and target 6, I return [0,1]; equal amounts can be used when they are different entries.",
+        ),
+    ] {
+        let turn = conversation.say(answer).await;
+        assert!(turn.framework_calls > 0, "no evidence call for {phase}");
+        assert!(
+            codetrial::agent::framework_progress(&conversation.state).contains(&phase),
+            "{phase} was acknowledged without recording"
+        );
+    }
+    conversation.say("I will keep a map from each amount to its earlier index. For each amount, look for target minus that amount before adding it, so an entry is never reused. This is a one-pass approach.").await;
+    conversation.state.code = "def solve(nums, target):\n    seen = {}\n    for i, n in enumerate(nums):\n        if target-n in seen: return [seen[target-n], i]\n        seen[n] = i\n".to_string();
+    conversation.contents.push(json!({"role": "user", "parts": [{"text": format!("[SYSTEM EVENT] Editor now contains:\n{}", conversation.state.code)}]}));
+    let packet =
+        json!({"code": conversation.state.code, "language": "python", "passed": 3, "total": 3});
+    let event = codetrial::agent::apply_data_event(
+        &mut conversation.state,
+        codetrial::runtime::TOPIC_TEST_RESULTS,
+        &packet,
+        99.0,
+    )
+    .generate_reply
+    .unwrap();
+    conversation.say(&event).await;
+    conversation.contents.push(json!({"role": "model", "parts": [{"text": "What are its time and space costs, and is there a useful improvement or trade-off?"}]}));
+    let turn = conversation.say("It takes O(n) expected time and O(n) extra space for the map. Sorting could reduce extra space with an in-place sort but costs O(n log n) time and loses the original indices unless we carry them. I would keep the map for the linear expected time.").await;
+    assert!(turn.framework_calls > 0);
+    assert!(codetrial::agent::framework_progress(&conversation.state).contains(&"optimizations"));
+}
+
+/// One phase judgment from the report model, as the room would ask for it.
+async fn judge_phases(state: &mut RuntimeState, problem: &'static Problem) -> Vec<&'static str> {
+    let prompt = take_phase_judge_window(state, problem);
+    let model = std::env::var("GEMINI_REPORT_MODEL")
+        .ok()
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| codetrial::config::DEFAULT_GEMINI_REPORT_MODEL.to_string());
+    let response: Value = reqwest::Client::new()
+        .post(format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        ))
+        .header("x-goog-api-key", gemini_key())
+        .json(&json!({
+            "systemInstruction": { "parts": [{ "text": phase_judge_system_instruction() }] },
+            "contents": [{ "parts": [{ "text": prompt }] }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "thinkingConfig": { "thinkingBudget": 0 },
+                "temperature": 0.0,
+            },
+        }))
+        .send()
+        .await
+        .expect("Gemini is reachable")
+        .json()
+        .await
+        .expect("Gemini answers JSON");
+    let text = response["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no judgment: {response}"));
+    apply_phase_judgment(state, text);
+    framework_progress(state)
+}
+
+/// The two sessions of the REACTO-progress reports, judged by the real report
+/// model: a restatement and an optimization the interviewer acknowledged
+/// without recording are ticked, and a step the interviewer did for the
+/// candidate, answered only with agreement, is not.
+#[tokio::test]
+#[ignore = "calls the Gemini report model; run with GOOGLE_API_KEY"]
+async fn the_phase_judge_ticks_what_the_candidate_said_and_nothing_else() {
+    let problem = get_problem(Some("insert-interval"));
+    let mut state = RuntimeState::for_problem(problem);
+    state.transcript = vec![
+        "Interviewer: Before you start, can you tell me in your own words what we need to do?"
+            .to_string(),
+        "Candidate: Sure. I get the existing busy blocks, which are sorted and do not overlap, \
+         plus one new block. I need to add the new block, merge it with any blocks it \
+         overlaps, and return the blocks still sorted by start time."
+            .to_string(),
+        "Interviewer: Good. What happens when two blocks only touch at an endpoint?".to_string(),
+    ];
+    let ticked = judge_phases(&mut state, problem).await;
+    assert!(ticked.contains(&"repeat"), "{ticked:?}");
+    assert!(
+        !ticked.contains(&"algorithm"),
+        "nothing was proposed yet: {ticked:?}"
+    );
+
+    let mut agreed = RuntimeState::for_problem(problem);
+    agreed.transcript = vec![
+        "Interviewer: So the plan is to sweep the blocks once, copying those that end before \
+         the new one, merging the overlapping ones, then copying the rest. Sound right?"
+            .to_string(),
+        "Candidate: Yeah, that sounds right to me.".to_string(),
+    ];
+    let ticked = judge_phases(&mut agreed, problem).await;
+    assert!(
+        !ticked.contains(&"algorithm"),
+        "agreement with the interviewer's plan is not the candidate's: {ticked:?}"
     );
 }

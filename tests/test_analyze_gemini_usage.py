@@ -221,6 +221,19 @@ class UsageTests(unittest.TestCase):
             "partial_or_unknown",
         )
 
+    def test_phase_judge_calls_and_skips_are_counted(self):
+        report = USAGE.analyze(
+            [
+                "gemini phase room=team:a call=1 retry=0 usage usage_samples=1 "
+                "prompt_tokens=40\n",
+                "phase judge skipped room=team:a: quota\n",
+            ]
+        )
+        room = report["rooms"][0]
+        self.assertEqual(room["room"], "team:a")
+        self.assertEqual(room["http"]["phase"]["records"], 1)
+        self.assertEqual(room["http_failures"]["phase_judge_skipped"], 1)
+
     def test_failure_lines_keep_a_room_name_with_a_colon(self):
         report = USAGE.analyze(
             [
@@ -235,7 +248,11 @@ class UsageTests(unittest.TestCase):
         self.assertEqual([room["room"] for room in report["rooms"]], ["team:a"])
         self.assertEqual(
             report["rooms"][0]["http_failures"],
-            {"report_transport_failed": 1, "interim_skipped": 1},
+            {
+                "report_transport_failed": 1,
+                "interim_skipped": 1,
+                "phase_judge_skipped": 0,
+            },
         )
 
     def test_context_curve_uses_turn_complete_observations(self):
@@ -307,7 +324,11 @@ class UsageTests(unittest.TestCase):
         room = USAGE.analyze(lines)["rooms"][0]
         self.assertEqual(
             room["http_failures"],
-            {"report_transport_failed": 2, "interim_skipped": 1},
+            {
+                "report_transport_failed": 2,
+                "interim_skipped": 1,
+                "phase_judge_skipped": 0,
+            },
         )
         self.assertNotIn("http", room)
         self.assertEqual(

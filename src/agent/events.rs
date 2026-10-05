@@ -13,12 +13,12 @@ use super::turn_taking::{
 use super::{
     DataEventResult, INTERVIEWER_SPEAKER, InterviewLoop, LanguageChoiceContext,
     LifecycleTransition, MAX_INTEGRITY_EVENTS, ROUND_TRANSITION_SKEW, RuntimeState, SincePrevious,
-    TIME_WARNING_S, TestRecord, TestSource, analyze_code, analyze_code_cached,
-    behavioral_time_warning, changed_excerpt, format_test_run_for_reaction, integrity_hash,
-    language_choice, observe_code, observe_code_cached, python_truthy, resume, round_skipped,
-    round_started, sanitize_integrity_event, sanitize_test_run, spoken_language,
-    test_reaction_decision, test_results_reaction, test_runner_unavailable_reaction,
-    test_setup_error_reaction, time_warning,
+    TIME_WARNING_S, TestSource, analyze_code, analyze_code_cached, behavioral_time_warning,
+    changed_excerpt, format_test_run_for_reaction, integrity_hash, language_choice, observe_code,
+    observe_code_cached, python_truthy, resume, round_skipped, round_started,
+    sanitize_integrity_event, sanitize_test_run, spoken_language, test_reaction_decision,
+    test_results_reaction, test_runner_unavailable_reaction, test_setup_error_reaction,
+    time_warning, uncredited_test_results_reaction,
 };
 use crate::runtime::{TOPIC_CODE_UPDATE, TOPIC_CONTROL, TOPIC_INTEGRITY, TOPIC_TEST_RESULTS};
 
@@ -102,6 +102,7 @@ fn apply_data_event_at_with_received(
     if state.paused && matches!(topic, TOPIC_CODE_UPDATE | TOPIC_TEST_RESULTS) {
         return DataEventResult::default();
     }
+    let was_complete = super::coding_round_complete(state);
     let mut result = match topic {
         TOPIC_CODE_UPDATE => apply_code_update(state, payload, receipt_timestamp_ms),
         TOPIC_TEST_RESULTS => apply_test_results(
@@ -114,6 +115,18 @@ fn apply_data_event_at_with_received(
         TOPIC_INTEGRITY => apply_integrity(state, payload),
         _ => DataEventResult::default(),
     };
+
+    // Whether Test can be recorded is a question about the state, not about
+    // which event changed it: switching back to the language of a credited run
+    // puts that run's code on screen again with no run arriving. Asked after
+    // every event, so an arm added later cannot be the one that forgets; a test
+    // run has already asked, to tell the interviewer, and this finds it done.
+    // Any other event that records it tells the interviewer here, since nothing
+    // else would, and a row that completes the coding round carries the
+    // follow-ups no later reply releases.
+    let received_test = super::reconcile_received_test(state, receipt_timestamp_ms)
+        .is_some()
+        .then(|| super::prompts::received_test_note(state, was_complete));
 
     if state.thinking_hold.is_active() && result.finish_interview.is_none() {
         match result.generate_reply.take() {
@@ -138,6 +151,21 @@ fn apply_data_event_at_with_received(
                 result.update_last_interjection = false;
                 result.held_context = held;
             }
+        }
+    }
+
+    // After the hold, which would otherwise replace context added before it.
+    if let Some(note) = received_test.filter(|_| result.finish_interview.is_none()) {
+        match result
+            .generate_reply
+            .as_mut()
+            .or(result.held_context.as_mut())
+        {
+            Some(text) => {
+                text.push('\n');
+                text.push_str(&note);
+            }
+            None => result.held_context = Some(note),
         }
     }
 
@@ -519,9 +547,11 @@ fn apply_test_results(
         .record_test(source_timestamp_ms, receipt_timestamp_ms, payload);
 
     // The cooldown keeps back-to-back runs from being narrated twice, but a run
-    // that makes Test recordable is the one reaction that has to be heard:
-    // nothing else tells the model to record it.
+    // that makes Test recordable is the one reaction that has to be heard: the
+    // checklist must advance even when the interviewer says nothing.
     let record = super::test_record_after_run(state, credited);
+    let was_complete = super::coding_round_complete(state);
+    let recorded = super::reconcile_received_test(state, receipt_timestamp_ms);
 
     // Likewise the first run to find the runner missing: the sanitized run
     // drops the flag, so this reaction is the only place the model learns a
@@ -533,7 +563,7 @@ fn apply_test_results(
     let decision = test_reaction_decision(
         state.ended,
         since_last_test_reaction_seconds,
-        record == TestRecord::Record || newly_unavailable,
+        recorded.is_some() || newly_unavailable,
     );
     let note = Some(super::TestRunNote {
         credited: since_previous,
@@ -557,14 +587,21 @@ fn apply_test_results(
     // Past the gate of a coding-only session an outage is still not the
     // candidate's to diagnose, so it continues from the credited run instead; a
     // compile error keeps the setup-error reaction.
-    let reply = if trace_open {
+    let uncredited = || {
+        uncredited_test_results_reaction(&summary, excerpt.as_deref(), state, recorded.is_some())
+    };
+    let mut reply = if trace_open {
         test_runner_unavailable_reaction(&summary, excerpt.as_deref())
     } else if outage && super::coding_continues_past_gate(state) {
-        super::prompts::uncredited_test_results_reaction(&summary, excerpt.as_deref(), state)
+        uncredited()
     } else if setup_error {
         test_setup_error_reaction(&summary, excerpt.as_deref())
-    } else if !credited && super::coding_continues_past_gate(state) {
-        super::prompts::uncredited_test_results_reaction(&summary, excerpt.as_deref(), state)
+    } else if !credited {
+        // Counts that earned no credit never choose the next step, whether or
+        // not Test is already recorded: once the platform records Test from a
+        // failing run, a later report without its code would otherwise read as
+        // "every one passed, move to Optimizations".
+        uncredited()
     } else {
         test_results_reaction(
             &summary,
@@ -575,6 +612,17 @@ fn apply_test_results(
             since_previous.unwrap_or(SincePrevious::Other),
         )
     };
+
+    if let Some(evidence) = recorded {
+        if let Some(reminder) = super::unrecorded_earlier_phases(state, &evidence) {
+            reply.push('\n');
+            reply.push_str(&reminder);
+        }
+        if !was_complete && let Some(follow_ups) = super::released_follow_ups(state) {
+            reply.push('\n');
+            reply.push_str(&follow_ups);
+        }
+    }
 
     // A passing reaction to a rewrite asks whether the analysis still holds,
     // and asks it once: the code it asked about is what the analysis now
@@ -644,21 +692,10 @@ fn apply_control(
         Some("pause_interview") if !state.ended => {
             control_pause(state, payload, receipt_timestamp_ms)
         }
-        Some("round_transition")
-            if !state.ended
-                && !state.paused
-                && state.interview_loop == InterviewLoop::CodingBehavioral
-                && !state.round_transition_seen
-                && payload.get("round").and_then(serde_json::Value::as_str)
-                    == Some("behavioral")
-                && state.started_at.elapsed() + ROUND_TRANSITION_SKEW
-                    >= std::time::Duration::from_secs(u64::from(state.coding_minutes) * 60) =>
-        {
-            DataEventResult {
-                preempts_hold: true,
-                ..control_round_transition(state, receipt_timestamp_ms)
-            }
-        }
+        Some("round_transition") if round_transition_due(state, payload) => DataEventResult {
+            preempts_hold: true,
+            ..control_round_transition(state, receipt_timestamp_ms)
+        },
         Some("time_warning")
             if !state.ended
                 && !state.paused
@@ -749,6 +786,17 @@ fn control_pause(
         update_last_interjection: !paused,
         ..DataEventResult::default()
     }
+}
+
+/// Whether a round transition can be applied or held for a pending judgment.
+pub(crate) fn round_transition_due(state: &RuntimeState, payload: &serde_json::Value) -> bool {
+    !state.ended
+        && !state.paused
+        && state.interview_loop == InterviewLoop::CodingBehavioral
+        && !state.round_transition_seen
+        && payload.get("round").and_then(serde_json::Value::as_str) == Some("behavioral")
+        && state.started_at.elapsed() + ROUND_TRANSITION_SKEW
+            >= std::time::Duration::from_secs(u64::from(state.coding_minutes) * 60)
 }
 
 /// The reserved behavioral round, opened or refused, once.

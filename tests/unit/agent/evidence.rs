@@ -3523,3 +3523,30 @@ fn a_class_body_binding_does_not_reach_its_methods() {
         Some(CodeChangeClass::Expression)
     );
 }
+
+#[test]
+fn automatic_test_coverage_uses_the_packets_server_receipt() {
+    let mut state = RuntimeState {
+        code: "def solve(nums):\n    return sorted(nums)\n".into(),
+        ..RuntimeState::default()
+    };
+    let packet = serde_json::json!({"code": state.code, "language": state.language, "passed": 0, "total": 3, "at": 42});
+    apply_data_event_at(
+        &mut state,
+        crate::runtime::TOPIC_TEST_RESULTS,
+        &packet,
+        0.0,
+        12_345,
+    );
+    let coverage = state
+        .evidence_ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.observation.get("coverage") == Some(&serde_json::json!("test")))
+        .collect::<Vec<_>>();
+    assert_eq!(coverage.len(), 1);
+    assert_eq!(coverage[0].receipt_timestamp_ms, 12_345);
+    assert_eq!(coverage[0].source_timestamp_ms, None);
+    assert_eq!(coverage[0].provenance, Provenance::Derived);
+    assert_eq!(state.evidence_ledger.coverage.covered, ["test"]);
+}

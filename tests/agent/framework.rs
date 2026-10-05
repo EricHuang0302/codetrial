@@ -821,18 +821,8 @@ fn framework_evaluation_scenarios_exercise_reactions_evidence_and_reports() {
 
         let mut state = with_written_code(RuntimeState::default());
         let evidence = case["evidence"].as_array().expect("evidence is an array");
-        if evidence
-            .iter()
-            .any(|item| item["phase"] == "test" && item["kind"] != "skipped")
-        {
-            receive_test_run(&mut state);
-        }
         assert!(evidence.len() <= MAX_FRAMEWORK_EVIDENCE);
         let round_gate = case["reaction"]["kind"] == "round_gate";
-        if !round_gate && case["round"] == "started" {
-            state.round_transition_seen = true;
-            state.behavioral_round_started = true;
-        }
         for (evidence_index, item) in evidence.iter().enumerate() {
             exact_fixture_keys(
                 item,
@@ -849,6 +839,13 @@ fn framework_evaluation_scenarios_exercise_reactions_evidence_and_reports() {
             );
             let phase = item["phase"].as_str().expect("phase is text");
             let behavioral = matches!(phase, "situation" | "task" | "action" | "result");
+            if phase == "test" && item["kind"] != "skipped" {
+                receive_test_run(&mut state);
+            }
+            if behavioral && !round_gate && case["round"] == "started" {
+                state.round_transition_seen = true;
+                state.behavioral_round_started = true;
+            }
             if !(round_gate && behavioral) {
                 exercised_phases.insert(record_evaluation_evidence(&mut state, item, id));
             }
@@ -1372,7 +1369,9 @@ fn the_evidence_cap_never_evicts_a_phases_only_observation() {
         mixed
             .framework_evidence
             .iter()
-            .any(|item| item.summary == "the only real test note"),
+            .any(|item| item.phase == FrameworkPhase::Test
+                && item.source == EvidenceSource::TestEvent
+                && item.kind == EvidenceKind::Observed),
         "the skip beside it made the observation look expendable"
     );
 
@@ -1408,7 +1407,8 @@ fn the_evidence_cap_never_evicts_a_phases_only_observation() {
             state
                 .framework_evidence
                 .iter()
-                .any(|item| item.summary == format!("the only {phase} note")),
+                .any(|item| framework_evidence_json(item)["phase"] == phase
+                    && item.kind != EvidenceKind::Skipped),
             "{phase} had one observation and the cap took it"
         );
     }
@@ -1780,6 +1780,17 @@ fn test_evidence_requires_execution_even_when_the_model_claims_it_happened() {
 }
 
 fn tested(state: &mut RuntimeState) -> Result<FrameworkEvidence, &'static str> {
+    // Probe new execution credit independently of the receipt row. Repeating
+    // that row is idempotent even after edits, while new credit must still pass
+    // the current-code gate these tests exercise.
+    let mut probe = state.clone();
+    probe
+        .framework_evidence
+        .retain(|row| row.phase != FrameworkPhase::Test || row.source != EvidenceSource::TestEvent);
+    record_framework_evidence(
+        &mut probe,
+        &json!({"phase": "test", "source": "test_event", "kind": "observed", "confidence": 90, "summary": "Probe current execution credit."}),
+    )?;
     record_framework_evidence(
         state,
         &json!({"phase": "test", "source": "test_event", "kind": "observed",
@@ -2115,6 +2126,12 @@ fn a_missing_runner_lets_a_hand_trace_stand_for_test() {
     record_framework_evidence(&mut state, &trace).unwrap();
     assert_eq!(framework_progress(&state), ["test"]);
 
+    // The trace is not a received run, so a run claimed after it is still
+    // refused rather than answered with the trace's row.
+    let mut claimed = trace.clone();
+    claimed["source"] = json!("test_event");
+    assert!(record_framework_evidence(&mut state, &claimed).is_err());
+
     // Only while it stays missing: an ordinary setup error is the candidate's
     // to fix, and the trace is refused again.
     let mut state = with_written_code(RuntimeState::default());
@@ -2155,9 +2172,87 @@ fn a_missing_runner_lets_a_hand_trace_stand_for_test() {
     tested(&mut state).unwrap();
 }
 
+/// A run credited while the editor showed another language's starter could
+/// not tick Test, since nothing the candidate wrote was on screen. Switching
+/// back puts that run's code on screen again, and the platform records Test
+/// then, rather than leaving the earlier run for the model to reconcile.
 #[test]
-fn a_test_reaction_asks_for_a_record_only_when_one_would_be_accepted() {
-    const RECORD: &str = "silently record it now";
+fn switching_back_to_a_tested_language_records_test_from_the_earlier_run() {
+    let problem = get_problem(Some("two-sum"));
+    let starter = |wanted: &str| {
+        problem
+            .variant()
+            .starters
+            .iter()
+            .find(|(language, _)| *language == wanted)
+            .map(|(_, code)| *code)
+            .expect("every problem has this starter")
+    };
+    let mut state = RuntimeState::for_problem(problem);
+    let python = format!(
+        "{}\n    seen = {{}}\n    for at, value in enumerate(nums):\n        if target - value in seen:\n            return [seen[target - value], at]\n        seen[value] = at\n",
+        starter("python")
+    );
+    let update = |state: &mut RuntimeState, code: &str, language: &str| {
+        apply_data_event(
+            state,
+            TOPIC_CODE_UPDATE,
+            &json!({"code": code, "language": language}),
+            99.0,
+        )
+    };
+    update(&mut state, &python, "python");
+    assert!(code_written(&state));
+    record_framework_evidence(
+        &mut state,
+        &json!({
+            "phase": "optimizations",
+            "source": "candidate_speech",
+            "kind": "observed",
+            "confidence": 80,
+            "summary": "Linear time with a hash map of seen values.",
+        }),
+    )
+    .unwrap();
+
+    // The run was submitted, then the candidate opened the C tab before its
+    // results arrived.
+    update(&mut state, starter("c"), "c");
+    assert!(!code_written(&state));
+    apply_data_event(
+        &mut state,
+        TOPIC_TEST_RESULTS,
+        &json!({"passed": 2, "total": 2, "code": python, "language": "python"}),
+        99.0,
+    );
+    assert_eq!(
+        framework_progress(&state),
+        ["optimizations"],
+        "the C starter is on screen"
+    );
+
+    // No reaction or evidence reply follows, so the switch itself tells the
+    // interviewer, with the follow-ups the completed coding round releases.
+    let switched = update(&mut state, &python, "python");
+    assert_eq!(framework_progress(&state), ["optimizations", "test"]);
+    let told = switched
+        .generate_reply
+        .or(switched.held_context)
+        .expect("the interviewer is told Test was recorded");
+    assert!(told.contains("recorded Test"), "{told}");
+    assert!(told.contains("Follow-ups"), "{told}");
+    let row = state
+        .framework_evidence
+        .iter()
+        .find(|row| row.phase == FrameworkPhase::Test)
+        .expect("Test was recorded");
+    assert_eq!(row.source, EvidenceSource::TestEvent);
+    assert_eq!(row.summary, RECEIVED_TEST_SUMMARY);
+}
+
+#[test]
+fn a_test_reaction_records_execution_before_asking_the_model_to_continue() {
+    const RECORD: &str = "platform recorded Test";
     let run = |state: &mut RuntimeState, code: &str, since: f64| {
         let payload = json!({"passed": 1, "total": 2, "code": code, "language": "python"});
         apply_data_event(state, TOPIC_TEST_RESULTS, &payload, since).generate_reply
@@ -2167,22 +2262,20 @@ fn a_test_reaction_asks_for_a_record_only_when_one_would_be_accepted() {
     let code = state.code.clone();
     assert!(run(&mut state, &code, 99.0).unwrap().contains(RECORD));
 
-    // A later run that earns nothing, here one without its code, does not take
-    // the reminder away while the earlier run still matches the editor, but its
-    // counts describe code the gate cannot match, so they are kept out of the
-    // next step. It does not jump the cooldown either.
+    // A later report without its submitted code changes no execution credit.
+    // Test is already recorded, so no reminder or cooldown override is needed.
     let bare = json!({"passed": 2, "total": 2, "language": "python"});
-    let reminded = apply_data_event(&mut state, TOPIC_TEST_RESULTS, &bare, 99.0)
+    let reaction = apply_data_event(&mut state, TOPIC_TEST_RESULTS, &bare, 99.0)
         .generate_reply
         .unwrap();
-    assert!(reminded.contains(RECORD), "{reminded}");
-    assert!(reminded.contains("from that earlier run"), "{reminded}");
-    assert!(
-        reminded.contains("cannot be matched to the code on screen"),
-        "{reminded}"
-    );
-    assert!(!reminded.contains("every one passed"), "{reminded}");
-    assert!(!reminded.contains("Optimizations"), "{reminded}");
+    assert!(!reaction.contains(RECORD), "{reaction}");
+    assert_eq!(framework_progress(&state), ["test"]);
+
+    // Its counts describe code the gate cannot match, so they never steer the
+    // interview, even though Test is already recorded from the failing run.
+    assert!(reaction.contains("no new execution evidence"), "{reaction}");
+    assert!(!reaction.contains("every one passed"), "{reaction}");
+    assert!(!reaction.contains("Optimizations"), "{reaction}");
     assert!(
         apply_data_event(&mut state, TOPIC_TEST_RESULTS, &bare, 1.0)
             .generate_reply
@@ -2228,7 +2321,7 @@ fn a_test_reaction_asks_for_a_record_only_when_one_would_be_accepted() {
     );
 
     // Inside the cooldown a run is not narrated, unless it is the one that
-    // makes Test recordable: nothing else would tell the model to record it.
+    // records Test, so the interviewer hears about its new execution evidence.
     let mut state = with_written_code(RuntimeState::default());
     let code = state.code.clone();
     let setup =
@@ -2364,7 +2457,7 @@ fn a_passing_rerun_after_the_analysis_does_not_reopen_optimizations() {
     // The silence that follows states the same facts.
     let nudge = silence_nudge(&state, "", None);
     assert!(!nudge.contains("narrate or test"), "{nudge}");
-    assert!(nudge.contains("The latest test run executed the code on screen"));
+    assert!(nudge.contains("The Test and Optimizations steps are done"));
 }
 
 /// The editor stays live while the runner works. A result for the code before
@@ -2816,7 +2909,7 @@ fn test_progress_states_whether_the_code_changed_since_the_run() {
     state.code.push_str("\nreturn None\n");
     let changed = silence_nudge(&state, "", None);
     assert!(
-        changed.contains("only a run of that code can complete Test"),
+        changed.contains("ask for a rerun only if the change could affect the result"),
         "{changed}"
     );
 
@@ -2868,9 +2961,10 @@ fn the_time_warning_does_not_reask_recorded_complexity() {
         "a run of the code on screen already exists"
     );
 
-    // Without that run, the warning still asks for one.
+    // Recorded Test is historical credit; a later edit still leaves room to
+    // confirm a final change without reopening the phase.
     state.code.push_str("\nif not nums:\n    return []\n");
-    assert!(time_warning(&state).contains("click Run on the highest-value tests"));
+    assert!(time_warning(&state).contains("confirm any final change"));
 }
 
 /// A rerun after an edit the Test gate would still credit as the same code is
@@ -2926,10 +3020,14 @@ fn the_reported_timeline_asks_for_nothing_already_done() {
         ];
         for (name, prompt) in &prompts {
             assert!(
-                prompt.contains(current),
+                prompt.contains(current)
+                    || (recorded && prompt.contains("The Test and Optimizations steps are done")),
                 "{name}, recorded={recorded}: {prompt}"
             );
-            assert!(prompt.contains(record), "{name}, recorded={recorded}");
+            assert!(
+                prompt.contains(record) || recorded,
+                "{name}, recorded={recorded}"
+            );
             assert!(!prompt.contains("narrate or test"), "{name}");
             assert!(
                 !prompt.contains("click Run on the highest-value tests"),
@@ -3023,23 +3121,22 @@ fn the_progress_clause_names_the_step_actually_open() {
         "{failing}"
     );
     assert!(
-        failing.contains("record it silently from that run"),
+        !failing.contains("record it silently from that run"),
         "{failing}"
     );
 
-    // Passing, but Test not recorded: record it from that run.
+    // A passing run records Test without a later model call.
     let mut state = with_written_code(RuntimeState::default());
     run_tests(&mut state, 3, 3);
     assert!(
-        silence_nudge(&state, "", None)
-            .contains("Test is not recorded yet, so record it silently from that run")
+        silence_nudge(&state, "", None).contains("The latest test run executed the code on screen")
     );
 
-    // No credited run of the code on screen: only a run completes Test.
+    // Test is already recorded; an edit invites a rerun only when needed.
     state.code.push_str("\nif not nums:\n    return []\n");
     let changed = silence_nudge(&state, "", None);
     assert!(
-        changed.contains("only a run of that code can complete Test"),
+        changed.contains("ask for a rerun only if the change could affect the result"),
         "{changed}"
     );
 
@@ -3440,4 +3537,660 @@ fn coding_only_delayed_passing_results_allow_verifying_small_edits() {
         "{reply}"
     );
     assert!(!reply.contains("all cases passed"), "{reply}");
+}
+
+#[test]
+fn received_execution_records_test_without_a_model_call() {
+    for passed in [0, 3] {
+        let mut state = with_written_code(RuntimeState::default());
+        state.started_at = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        let result = run_tests(&mut state, passed, 3);
+        assert_eq!(framework_progress(&state), ["test"]);
+        assert_eq!(state.framework_evidence.len(), 1);
+        let row = &state.framework_evidence[0];
+        assert_eq!(row.source, EvidenceSource::TestEvent);
+        assert_eq!(row.kind, EvidenceKind::Observed);
+        assert!((120_000..125_000).contains(&row.at_ms));
+        assert!(row.summary.contains("unverified"));
+        assert!(
+            result
+                .generate_reply
+                .unwrap()
+                .contains("platform recorded Test")
+        );
+        run_tests(&mut state, passed, 3);
+        assert_eq!(
+            state.framework_evidence.len(),
+            1,
+            "reruns do not duplicate credit"
+        );
+        assert_eq!(framework_progress(&state), ["test"]);
+        assert!(
+            released_follow_ups(&state).is_none(),
+            "Test alone is not coding completion"
+        );
+    }
+}
+
+#[test]
+fn automatic_test_credit_obeys_submission_and_session_gates() {
+    let mut cases = Vec::new();
+    let written = with_written_code(RuntimeState::default());
+    let code = written.code.clone();
+    for packet in [
+        json!({"code": code, "language": "python", "total": 0}),
+        json!({"code": code, "language": "python", "total": 3, "setupError": "SyntaxError"}),
+        json!({"code": code, "language": "python", "total": 0, "setupError": "HTTP 503", "runnerUnavailable": true}),
+        json!({"code": code, "language": "javascript", "total": 3}),
+        json!({"code": "def solve(nums): return []", "language": "python", "total": 3}),
+        json!({"total": 3}),
+    ] {
+        cases.push((with_written_code(RuntimeState::default()), packet));
+    }
+    for state in [
+        RuntimeState {
+            paused: true,
+            ..with_written_code(RuntimeState::default())
+        },
+        RuntimeState {
+            ended: true,
+            ..with_written_code(RuntimeState::default())
+        },
+        RuntimeState {
+            behavioral_round_started: true,
+            ..with_written_code(RuntimeState::default())
+        },
+        RuntimeState {
+            code_templates: [("python".to_string(), code.clone())].into(),
+            ..with_written_code(RuntimeState::default())
+        },
+    ] {
+        cases.push((
+            state,
+            json!({"code": code, "language": "python", "total": 3}),
+        ));
+    }
+    assert_eq!(cases.len(), 10);
+    for (mut state, packet) in cases {
+        apply_data_event(&mut state, TOPIC_TEST_RESULTS, &packet, 0.0);
+        assert!(
+            state.framework_evidence.is_empty(),
+            "unexpected credit for {packet}"
+        );
+    }
+
+    let mut held = with_written_code(RuntimeState::default());
+    apply_data_event(
+        &mut held,
+        TOPIC_CONTROL,
+        &json!({"type": "thinking", "thinking": true}),
+        0.0,
+    );
+    assert!(held.thinking_hold.is_active());
+    let result = run_tests(&mut held, 0, 3);
+    assert_eq!(framework_progress(&held), ["test"]);
+    assert!(result.generate_reply.is_none());
+    assert!(result.held_context.is_some());
+}
+
+#[test]
+fn automatic_test_record_retains_reconciliation_and_follow_ups() {
+    let mut state = with_written_code(RuntimeState::for_problem(get_problem(Some("two-sum"))));
+    record_framework_evidence(
+        &mut state,
+        &json!({
+            "phase": "optimizations", "source": "candidate_speech", "kind": "observed",
+            "confidence": 90, "summary": "Explained linear time and space for a hash map."
+        }),
+    )
+    .unwrap();
+    let reply = run_tests(&mut state, 3, 3).generate_reply.unwrap();
+    assert!(
+        reply.contains("repeat, example, algorithm, coding"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("if they skipped it, record nothing"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains(&released_follow_ups(&state).unwrap()),
+        "{reply}"
+    );
+    assert_eq!(framework_progress(&state), ["optimizations", "test"]);
+    let next = run_tests(&mut state, 3, 3).generate_reply.unwrap();
+    assert!(!next.contains("Unrecorded earlier"), "{next}");
+    assert!(!next.contains("Follow-ups you may"), "{next}");
+    past_the_coding_round(&mut state);
+    apply_data_event(
+        &mut state,
+        TOPIC_CONTROL,
+        &json!({"type": "round_transition", "round": "behavioral"}),
+        99.0,
+    );
+    assert!(state.behavioral_round_started);
+}
+
+#[test]
+fn a_held_run_keeps_its_reconciliation_and_released_follow_ups() {
+    let mut state = with_written_code(RuntimeState::for_problem(get_problem(Some("two-sum"))));
+    record_framework_evidence(&mut state, &json!({"phase": "optimizations", "source": "candidate_speech", "kind": "observed", "confidence": 90, "summary": "Explained linear complexity for the written code."})).unwrap();
+    apply_data_event(
+        &mut state,
+        TOPIC_CONTROL,
+        &json!({"type": "thinking", "thinking": true}),
+        99.0,
+    );
+    let result = run_tests(&mut state, 1, 3);
+    assert!(result.generate_reply.is_none());
+    assert!(!result.yield_turn);
+    assert_eq!(result.thinking_changed, None);
+    let context = result.held_context.unwrap();
+    assert!(context.contains("Unrecorded earlier step(s)"));
+    assert!(context.contains(&released_follow_ups(&state).unwrap()));
+    assert_eq!(framework_progress(&state), ["optimizations", "test"]);
+}
+
+fn judged(steps: Value) -> String {
+    json!({ "steps": steps }).to_string()
+}
+
+/// A judgment as the room makes one: the window is taken, which records what
+/// the judge was shown, and the answer is applied to the state as it is then.
+fn judge(state: &mut RuntimeState, steps: Value) -> Vec<FrameworkEvidence> {
+    take_phase_judge_window(state, get_problem(Some("insert-interval")));
+    apply_phase_judgment(state, &judged(steps))
+}
+
+/// The steps a candidate saw acknowledged but never ticked: a restatement and
+/// an optimization the interviewer answered without recording. The platform's
+/// judge records them, but only with the candidate's own words as the quote,
+/// matched without regard to case or punctuation, and the row keeps the quote.
+#[test]
+fn the_phase_judge_records_a_spoken_step_the_interviewer_left_unrecorded() {
+    let mut state = RuntimeState {
+        transcript: vec![
+            "Interviewer: Can you tell me what the problem is asking?".to_string(),
+            "Candidate: So I get a list of intervals and a new interval, and I need to merge \
+             any overlaps and return them in order."
+                .to_string(),
+            "Interviewer: Great, what about the endpoints?".to_string(),
+        ],
+        ..RuntimeState::default()
+    };
+    assert_eq!(phase_judge_open(&state), ["repeat", "example", "algorithm"]);
+    let recorded = judge(
+        &mut state,
+        json!([{
+            "step": "repeat",
+            "quote": "I need to merge any overlaps, and return them in order",
+            "summary": "Restated: merge the new interval into a sorted list."
+        }]),
+    );
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].source, EvidenceSource::CandidateSpeech);
+    assert!(
+        recorded[0]
+            .summary
+            .ends_with("Quote: \"I need to merge any overlaps, and return them in order\""),
+        "{}",
+        recorded[0].summary
+    );
+    assert_eq!(framework_progress(&state), ["repeat"]);
+
+    // Optimizations, with code on screen.
+    let mut state = with_written_code(state);
+    state.transcript.push(
+        "Candidate: My solution uses a new result vector so it is O of n space, I could \
+         rearrange in place to save memory."
+            .to_string(),
+    );
+    judge(
+        &mut state,
+        json!([{"step": "optimizations",
+            "quote": "it is O of n space", "summary": "O(n) space; in place would save it."}]),
+    );
+    assert!(framework_progress(&state).contains(&"optimizations"));
+}
+
+/// Nothing the judge says is taken on its word.
+#[test]
+fn the_phase_judge_is_refused_anything_it_cannot_ground() {
+    // The unrecognized turn comes first: as the candidate's latest turn it
+    // would refuse every speech record on its own, and each case below must be
+    // refused for the reason it names.
+    let base = || RuntimeState {
+        transcript: vec![
+            // Multi-byte non-Latin letters exercise the recognition gate.
+            "Candidate: αβγ δεζ ηθι κλμ νξο πρσ".to_string(),
+            "Interviewer: So you would sort by start time and sweep, merging as you go."
+                .to_string(),
+            "Candidate: yes so you would sort by start time and sweep".to_string(),
+            "Candidate: I already restated it".to_string(),
+        ],
+        ..RuntimeState::default()
+    };
+    let refused = [
+        (
+            "the interviewer's words are not the candidate's",
+            json!([{"step": "algorithm", "quote": "merging as you go along", "summary": "s"}]),
+        ),
+        (
+            "an approach repeated back is agreement, not an explanation",
+            json!([{"step": "algorithm", "quote": "sort by start time and sweep", "summary": "s"}]),
+        ),
+        (
+            "a paraphrase is not a quote",
+            json!([{"step": "algorithm", "quote": "they sort the intervals first then merge", "summary": "s"}]),
+        ),
+        (
+            "too short to show a restatement",
+            json!([{"step": "repeat", "quote": "I already restated it", "summary": "s"}]),
+        ),
+        (
+            "a turn the recognizer could not read is not evidence",
+            json!([{"step": "algorithm", "quote": "αβγ δεζ ηθι κλμ νξο πρσ", "summary": "s"}]),
+        ),
+        (
+            "Test belongs to the run",
+            json!([{"step": "test", "quote": "yes so you would sort by start time", "summary": "s"}]),
+        ),
+        (
+            "Coding needs code",
+            json!([{"step": "coding", "quote": "yes so you would sort by start time", "summary": "s"}]),
+        ),
+    ];
+    for (why, steps) in refused {
+        let mut state = base();
+        assert!(judge(&mut state, steps).is_empty(), "{why}");
+        assert!(framework_progress(&state).is_empty(), "{why}");
+    }
+    let mut state = base();
+    for malformed in ["not json", "{}", "[]", r#"{"steps": "repeat"}"#] {
+        assert!(
+            apply_phase_judgment(&mut state, malformed).is_empty(),
+            "{malformed}"
+        );
+    }
+
+    // A step the interviewer recorded while the call was out is left alone.
+    let mut state = RuntimeState {
+        transcript: vec![
+            "Candidate: we need the merged intervals back in sorted order by start".into(),
+        ],
+        ..RuntimeState::default()
+    };
+    take_phase_judge_window(&mut state, get_problem(Some("insert-interval")));
+    record_framework_evidence(
+        &mut state,
+        &json!({"phase": "repeat", "source": "candidate_speech", "kind": "observed",
+            "confidence": 90, "summary": "Restated."}),
+    )
+    .unwrap();
+    let steps = judged(json!([{"step": "repeat",
+        "quote": "we need the merged intervals back", "summary": "again"}]));
+    assert!(apply_phase_judgment(&mut state, &steps).is_empty());
+    assert_eq!(state.framework_evidence.len(), 1);
+
+    // No REACTO step is recorded once the behavioral round is open.
+    state.behavioral_round_started = true;
+    assert!(phase_judge_open(&state).is_empty());
+}
+
+/// Coding is grounded in what the candidate typed, never in speech or in the
+/// starter the page served.
+#[test]
+fn the_phase_judge_grounds_coding_in_what_the_candidate_typed() {
+    let mut state = with_written_code(RuntimeState::default());
+    state.code_templates.insert(
+        state.language.clone(),
+        "def solve(nums):\n    pass\n".to_string(),
+    );
+    state.code = "def solve(nums):\n    pass\n    return sorted(nums)\n".to_string();
+    assert!(phase_judge_open(&state).contains(&"coding"));
+    let speech = json!([{"step": "coding", "quote": "I wrote the whole thing", "summary": "s"}]);
+    assert!(judge(&mut state, speech).is_empty());
+    let starter = json!([{"step": "coding", "quote": "def solve(nums): pass", "summary": "s"}]);
+    assert!(
+        judge(&mut state, starter).is_empty(),
+        "the starter is not theirs"
+    );
+    let code = json!([{"step": "coding", "quote": "return sorted(nums)",
+        "summary": "Sorted the input and returned it."}]);
+    assert!(
+        judge(&mut state, code.clone()).is_empty(),
+        "three words is too few"
+    );
+    let code = json!([{"step": "coding", "quote": "pass return sorted(nums)",
+        "summary": "Sorted the input and returned it."}]);
+    let recorded = judge(&mut state, code);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].source, EvidenceSource::EditorSnapshot);
+}
+
+/// A judgment about code the candidate rewrote while the call was out is
+/// dropped: recording it would anchor an analysis of the old code to the new.
+#[test]
+fn a_judgment_about_rewritten_code_is_dropped() {
+    let mut state = with_written_code(RuntimeState::default());
+    state
+        .transcript
+        .push("Candidate: sorting makes this O of n log n time".to_string());
+    take_phase_judge_window(&mut state, get_problem(Some("insert-interval")));
+    state.code = "def solve(nums):\n    seen = set()\n    out = []\n    for n in nums:\n        \
+                  if n not in seen:\n            seen.add(n)\n            out.append(n)\n    return out\n"
+        .to_string();
+    let steps = judged(json!([{"step": "optimizations",
+        "quote": "this O of n log n time", "summary": "n log n."}]));
+    assert!(apply_phase_judgment(&mut state, &steps).is_empty());
+    assert!(
+        phase_judge_due(&state),
+        "the new code is due a judgment of its own"
+    );
+}
+
+#[test]
+fn a_judgment_about_another_language_is_dropped_even_with_identical_code() {
+    let mut state = with_written_code(RuntimeState::default());
+    state
+        .transcript
+        .push("Candidate: sorting makes this O of n log n time".into());
+    take_phase_judge_window(&mut state, get_problem(Some("insert-interval")));
+    state.language = "javascript".into();
+    assert!(phase_judge_due(&state));
+    let steps = judged(json!([{"step": "optimizations",
+        "quote": "this O of n log n time", "summary": "n log n."}]));
+    assert!(apply_phase_judgment(&mut state, &steps).is_empty());
+}
+
+/// The end of the interview waits for a judgment of the candidate's last
+/// answer, so one that lands after the end is applied, not discarded.
+#[test]
+fn a_judgment_landing_at_the_end_is_still_recorded() {
+    let mut state = with_written_code(RuntimeState::default());
+    state
+        .transcript
+        .push("Candidate: it runs in O of n time and constant extra space".to_string());
+    take_phase_judge_window(&mut state, get_problem(Some("insert-interval")));
+    state.ended = true;
+    let steps = judged(json!([{"step": "optimizations",
+        "quote": "it runs in O of n time", "summary": "O(n) time, O(1) space."}]));
+    assert_eq!(apply_phase_judgment(&mut state, &steps).len(), 1);
+}
+
+/// The interviewer is told what the judge recorded, and when that completed
+/// the coding round, given the follow-ups an evidence reply would have carried.
+#[test]
+fn the_interviewer_hears_what_the_judge_recorded_and_the_follow_ups_it_released() {
+    let problem = get_problem(Some("two-sum"));
+    let mut state = with_written_code(RuntimeState::for_problem(problem));
+    assert!(!state.follow_ups.is_empty(), "the fixture needs follow-ups");
+    receive_test_run(&mut state);
+    state
+        .transcript
+        .push("Candidate: the hash map makes it O of n time and O of n space".to_string());
+    // Test is recorded and Optimizations is not, so the round is incomplete.
+    let was_complete = framework_progress(&state).contains(&"optimizations");
+    let recorded = judge(
+        &mut state,
+        json!([{"step": "optimizations", "quote": "it O of n time and O of n space",
+            "summary": "O(n) time and space."}]),
+    );
+    assert_eq!(recorded.len(), 1);
+    let note = phase_judgment_note(&state, &recorded, was_complete);
+    assert!(note.contains("recorded optimizations"), "{note}");
+    assert!(note.contains("needs no reply"), "{note}");
+    assert!(note.contains(state.follow_ups[0]), "{note}");
+
+    // Already complete: nothing to release twice.
+    let again = phase_judgment_note(&state, &recorded, true);
+    assert!(!again.contains(state.follow_ups[0]), "{again}");
+}
+
+/// A call is due only for something the judge has not seen: a new candidate
+/// turn, the latest one grown since it was read, or an editor it has not read
+/// while Coding is open. Once every judged step is closed nothing is due.
+#[test]
+fn the_phase_judge_is_due_only_for_what_it_has_not_read() {
+    let problem = get_problem(Some("two-sum"));
+    let mut state = RuntimeState::for_problem(problem);
+    assert!(!phase_judge_due(&state));
+    state
+        .transcript
+        .push("Interviewer: Tell me about the problem.".to_string());
+    assert!(!phase_judge_due(&state), "only the candidate's turns count");
+    state
+        .transcript
+        .push("Candidate: I return the indices".to_string());
+    assert!(phase_judge_due(&state));
+
+    let prompt = take_phase_judge_window(&mut state, problem);
+    assert!(
+        prompt.contains("OPEN STEPS: repeat, example, algorithm"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("I return the indices"), "{prompt}");
+    assert!(
+        !prompt.contains(problem.title),
+        "the published name stays out"
+    );
+    for constraint in problem.variant().constraints {
+        assert!(
+            prompt.contains(constraint),
+            "a restatement is judged against {constraint}"
+        );
+    }
+    assert!(!phase_judge_due(&state));
+
+    // The same words said again as a new turn are still a new turn.
+    state.transcript.push("Interviewer: Go on.".to_string());
+    state
+        .transcript
+        .push("Candidate: I return the indices".to_string());
+    assert!(phase_judge_due(&state), "a repeated turn is new");
+    take_phase_judge_window(&mut state, problem);
+
+    // The recognizer finishes the turn in place, after the judge read half.
+    *state.transcript.last_mut().unwrap() =
+        "Candidate: I return the indices of two numbers adding to target".to_string();
+    assert!(phase_judge_due(&state), "the rest of the turn is new");
+    take_phase_judge_window(&mut state, problem);
+
+    let mut state = with_written_code(state);
+    assert!(phase_judge_due(&state), "an editor the judge has not read");
+    take_phase_judge_window(&mut state, problem);
+    assert!(!phase_judge_due(&state));
+
+    // Recorded Coding closes the spoken steps to the judge.
+    record_framework_evidence(
+        &mut state,
+        &json!({"phase": "coding", "source": "editor_snapshot", "kind": "observed",
+            "confidence": 90, "summary": "Wrote it."}),
+    )
+    .unwrap();
+    assert_eq!(phase_judge_open(&state), ["optimizations"]);
+    record_framework_evidence(
+        &mut state,
+        &json!({"phase": "optimizations", "source": "candidate_speech", "kind": "observed",
+            "confidence": 90, "summary": "O(n)."}),
+    )
+    .unwrap();
+    state
+        .transcript
+        .push("Candidate: anything else to add here".to_string());
+    assert!(!phase_judge_due(&state), "every judged step is closed");
+}
+
+/// An interviewer saying the candidate's approach back, which is how one
+/// confirms they followed, leaves the candidate's words theirs; only words the
+/// interviewer said first are agreement. And one answer the recognizer split
+/// into two lines is still one turn, so a quote may cross the split, but not
+/// an interviewer line between two answers.
+#[test]
+fn the_echo_rule_reads_who_spoke_first_and_a_split_turn_is_one_turn() {
+    let mut state = RuntimeState {
+        transcript: vec![
+            "Candidate: I would sort by start time and sweep once, merging as I go.".into(),
+            "Interviewer: So you would sort by start time and sweep once. Good.".into(),
+        ],
+        ..RuntimeState::default()
+    };
+    let steps = json!([{"step": "algorithm",
+        "quote": "sort by start time and sweep once", "summary": "Sort and sweep."}]);
+    assert_eq!(
+        judge(&mut state, steps).len(),
+        1,
+        "the candidate said it first"
+    );
+
+    let split = || RuntimeState {
+        transcript: vec![
+            "Candidate: so for one two three and target five".into(),
+            "Candidate: I would return indices one and two".into(),
+            "Interviewer: Okay.".into(),
+            "Candidate: and then something else entirely".into(),
+        ],
+        ..RuntimeState::default()
+    };
+    let across = json!([{"step": "example",
+        "quote": "target five I would return indices one and two", "summary": "[1,2,3], 5."}]);
+    assert_eq!(
+        judge(&mut split(), across).len(),
+        1,
+        "one answer, split in two"
+    );
+    let over = json!([{"step": "example",
+        "quote": "indices one and two and then something else", "summary": "s"}]);
+    assert!(
+        judge(&mut split(), over).is_empty(),
+        "two answers are two turns"
+    );
+}
+
+/// One answer can complete several steps, and the judge lists them in any
+/// order. Coding closing the spoken steps to later calls must not refuse a
+/// restatement listed after it in the same answer.
+#[test]
+fn steps_in_one_judgment_are_judged_against_the_steps_open_when_it_was_asked() {
+    let mut state = with_written_code(RuntimeState {
+        transcript: vec![
+            "Candidate: I take a sorted list of intervals and one new interval and return \
+             the merged sorted list"
+                .into(),
+        ],
+        ..RuntimeState::default()
+    });
+    let steps = json!([
+        {"step": "coding", "quote": "def solve(nums): return sorted(nums)", "summary": "Wrote it."},
+        {"step": "repeat", "quote": "and return the merged sorted list", "summary": "Restated."},
+        {"step": "repeat", "quote": "and one new interval and return the merged", "summary": "Again."}
+    ]);
+    let recorded = judge(&mut state, steps);
+    let phases = recorded.iter().map(|row| row.phase).collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        [FrameworkPhase::Coding, FrameworkPhase::Repeat],
+        "{recorded:?}"
+    );
+    assert!(recorded[1].summary.starts_with("Restated."), "{recorded:?}");
+
+    // A later call, with Coding recorded, no longer records a spoken step.
+    let mut state = with_written_code(RuntimeState {
+        transcript: vec![
+            "Candidate: for one two three and target five it returns one and two".into(),
+        ],
+        ..RuntimeState::default()
+    });
+    record_framework_evidence(
+        &mut state,
+        &json!({"phase": "coding", "source": "editor_snapshot", "kind": "observed",
+            "confidence": 90, "summary": "Wrote it."}),
+    )
+    .unwrap();
+    let late = json!([{"step": "example",
+        "quote": "target five it returns one and two", "summary": "Worked a case."}]);
+    assert!(judge(&mut state, late).is_empty());
+}
+
+/// The judge reads a bounded tail of the transcript and head of the editor:
+/// enough for an answer of several kilobytes to arrive whole, not the whole
+/// interview.
+#[test]
+fn the_phase_judge_reads_a_bounded_tail_and_head() {
+    let problem = get_problem(Some("insert-interval"));
+    let line = |marker: &str| format!("Candidate: {marker} {}", "word ".repeat(200));
+    let mut state = RuntimeState::for_problem(problem);
+    state.transcript = vec![line("oldest-line")];
+    state.transcript.extend((0..3).map(|_| line("middle")));
+    state.transcript.push(line("recent-line"));
+    let prompt = take_phase_judge_window(&mut state, problem);
+    assert!(prompt.contains("recent-line"), "the latest stretch arrives");
+    assert!(
+        prompt.contains("oldest-line"),
+        "five kilobytes of tail arrive whole"
+    );
+    state.transcript.extend((0..10).map(|_| line("newer")));
+    let prompt = take_phase_judge_window(&mut state, problem);
+    assert!(
+        !prompt.contains("oldest-line"),
+        "the opening is past the bound"
+    );
+
+    let mut state = with_written_code(RuntimeState::for_problem(problem));
+    let body = |marker: &str, lines: usize| format!("# {marker}\n{}", "x = 1\n".repeat(lines));
+    state.code = format!("{}{}", body("first-block", 1100), body("last-block", 10));
+    let prompt = take_phase_judge_window(&mut state, problem);
+    assert!(prompt.contains("first-block"), "the head arrives");
+    assert!(
+        prompt.contains(&"x = 1\n".repeat(600)),
+        "kilobytes of code arrive"
+    );
+    assert!(
+        !prompt.contains("last-block"),
+        "the tail of a long file is cut"
+    );
+}
+
+/// The speech gate refuses evidence while the candidate's latest turn was not
+/// recognized, since a summary written from it would carry garbled audio into
+/// the report. A judged quote was found in an earlier recognized turn, so a
+/// later garbled one leaves it standing, while the interviewer's own speech
+/// record is still refused.
+#[test]
+fn a_garbled_later_turn_leaves_a_verified_quote_standing() {
+    let mut state = RuntimeState {
+        transcript: vec![
+            "Candidate: I get the busy blocks and one new block and return them merged in order"
+                .into(),
+            "Candidate: 我们先排序然后合并重叠的区间吧".into(),
+        ],
+        ..RuntimeState::default()
+    };
+    let spoken = json!({"phase": "repeat", "source": "candidate_speech", "kind": "observed",
+        "confidence": 90, "summary": "Restated."});
+    assert!(record_framework_evidence(&mut state, &spoken).is_err());
+    let steps = json!([{"step": "repeat",
+        "quote": "one new block and return them merged in order", "summary": "Restated."}]);
+    assert_eq!(judge(&mut state, steps).len(), 1);
+}
+
+/// A call that failed is answered with nothing. The window it read is opened
+/// again, so the candidate's last answer is judged by the next call rather than
+/// waiting for a turn that may never come.
+#[test]
+fn a_failed_judgment_leaves_its_window_to_be_read_again() {
+    let problem = get_problem(Some("insert-interval"));
+    let mut state = with_written_code(RuntimeState::for_problem(problem));
+    state
+        .transcript
+        .push("Candidate: it is O of n time and constant space".to_string());
+    take_phase_judge_window(&mut state, problem);
+    assert!(!phase_judge_due(&state));
+    assert!(apply_phase_judgment(&mut state, "").is_empty());
+    assert!(phase_judge_due(&state), "the failed window is due again");
+
+    // An answer that found nothing is a judgment, not a failure.
+    take_phase_judge_window(&mut state, problem);
+    apply_phase_judgment(&mut state, r#"{"steps": []}"#);
+    assert!(!phase_judge_due(&state));
 }

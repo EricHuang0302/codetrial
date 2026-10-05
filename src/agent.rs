@@ -45,6 +45,7 @@ pub use evidence::{
     ObservationFamily, Provenance,
 };
 // For the `livekit` tests, which size a buffer past the parse limit from it.
+pub(crate) use events::round_transition_due;
 #[cfg(test)]
 pub(crate) use evidence::MAX_PARSED_BYTES;
 pub(crate) use evidence::{ModelInputKind, ViewFor};
@@ -57,15 +58,17 @@ pub use problems::{DEFAULT_PROBLEM_ID, PROBLEMS, find_problem, get_problem, topi
 pub(crate) use prompts::BEHAVIORAL_ROUND_MARK;
 pub use prompts::{
     BehavioralRound, InterimReviewInput, LanguageChoiceContext, MAX_EXCERPT_LINE_CHARS,
-    MAX_NUMBERED_BYTES, ReportPromptInput, SincePrevious, TestRecord, behavioral_silence_nudge,
-    behavioral_time_warning, build_instructions_for_plan, changed_excerpt, cold_restart,
-    compressed_context, format_test_run, format_test_run_for_reaction, greeting,
-    hint_ladder_used_text, hint_rung_text, hint_rung_withheld_text, interim_review_prompt,
-    interim_system_instruction, language_choice, log_hint_text, numbered, numbered_from,
-    owed_reply, proactive_review, read_editor_text, released_follow_ups, report_prompt,
-    report_system_instruction, resume, resumed_context, rolling_assessment, round_skipped,
-    round_started, silence_nudge, spoken_language, test_results_reaction,
-    test_runner_unavailable_reaction, test_setup_error_reaction, time_warning,
+    MAX_NUMBERED_BYTES, PhaseJudgeInput, ReportPromptInput, SincePrevious, TestRecord,
+    behavioral_silence_nudge, behavioral_time_warning, build_instructions_for_plan,
+    changed_excerpt, cold_restart, compressed_context, format_test_run,
+    format_test_run_for_reaction, greeting, hint_ladder_used_text, hint_rung_text,
+    hint_rung_withheld_text, interim_review_prompt, interim_system_instruction, language_choice,
+    log_hint_text, numbered, numbered_from, owed_reply, phase_judge_prompt,
+    phase_judge_system_instruction, phase_judgment_note, proactive_review, read_editor_text,
+    received_test_note, released_follow_ups, report_prompt, report_system_instruction, resume,
+    resumed_context, rolling_assessment, round_skipped, round_started, silence_nudge,
+    spoken_language, test_results_reaction, test_runner_unavailable_reaction,
+    test_setup_error_reaction, time_warning, uncredited_test_results_reaction,
     unrecorded_earlier_phases, with_owed_reply, wrap_up,
 };
 pub(crate) use prompts::{editor_tool_continuity, end_interview_refusal, report_transcript_lines};
@@ -168,8 +171,8 @@ pub const THINKING_CHECK_IN_S: u64 = 120;
 pub(crate) const THINKING_RELEASE_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(10);
 
-pub const INTERVIEW_CONTRACT_BUNDLE_VERSION: u32 = 28;
-pub const LIVE_PROMPT_VERSION: u32 = 20;
+pub const INTERVIEW_CONTRACT_BUNDLE_VERSION: u32 = 29;
+pub const LIVE_PROMPT_VERSION: u32 = 21;
 pub const REPORT_PROMPT_VERSION: u32 = 16;
 pub const RUBRIC_VERSION: u32 = 1;
 pub const REPORT_SCHEMA_VERSION: u32 = 2;
@@ -753,6 +756,9 @@ pub struct RuntimeState {
     /// The declared hold state the page has not been told yet; see
     /// `take_thinking_notice`.
     pub thinking_notice: Option<bool>,
+    /// The checklist the page was last told, cleared when the candidate
+    /// rejoins with an empty one; see `framework_progress_unpublished`.
+    pub framework_published: Vec<&'static str>,
     /// A reply the hold dropped is still in the model's history, and the
     /// release has to say so; see `thinking_resume`.
     pub thinking_unheard_reply: bool,
@@ -872,14 +878,25 @@ pub struct RuntimeState {
     /// shown. The window it gets is everything after this, so a pause that
     /// arrives with nothing new said costs no call at all.
     pub interim_transcript_lines: usize,
+    /// How many transcript lines the phase judge has been shown, and the
+    /// editor it last read; a call is due only when one of them moved. See
+    /// `phase_judge_due`.
+    pub judged_transcript_lines: usize,
+    pub judged_last_turn: String,
+    pub judged_code: String,
+    pub judged_language: String,
     /// The editor the last idle-window review was sent. A review whose code
     /// has not changed since says so instead of sending up to four kilobytes
     /// a note on record already read; like the transcript cursor, it moves
     /// when the call goes out.
     pub interim_code: String,
     /// The earlier steps an evidence reply has already named as open, so each
-    /// is named once; see `unrecorded_earlier_phases`.
+    /// is named once; see `unrecorded_earlier_phases`. A reminder written into
+    /// a reply waits in `earlier_steps_pending` until that reply is delivered,
+    /// so one that never reaches the model does not use up the naming; see
+    /// `settle_earlier_steps`.
     pub earlier_steps_named: Vec<&'static str>,
+    pub earlier_steps_pending: Vec<&'static str>,
     /// The buffer the Live model was last shown, whole or around a change: by a
     /// watch prompt, a test reaction, `read_editor`, a requested hint or a
     /// cold-restart briefing. The next watch prompt or test reaction shows the
@@ -901,6 +918,15 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
+    /// The reply carrying a reminder of open earlier steps went out, or did
+    /// not: delivered, the steps count as named; lost, they may be named again.
+    pub(crate) fn settle_earlier_steps(&mut self, delivered: bool) {
+        let pending = std::mem::take(&mut self.earlier_steps_pending);
+        if delivered {
+            self.earlier_steps_named.extend(pending);
+        }
+    }
+
     /// A fresh interview of this problem: its hint ladder and its starters,
     /// which nothing the browser sends may replace. Built here rather than by
     /// whoever starts a room, because a state missing either answers every hint
@@ -941,6 +967,7 @@ impl Default for RuntimeState {
             thinking_hold: ThinkingHold::Off,
             thinking_released_at: None,
             thinking_notice: None,
+            framework_published: Vec::new(),
             thinking_unheard_reply: false,
             recovery_reply_pending: false,
             framework_evidence: Vec::new(),
@@ -972,8 +999,13 @@ impl Default for RuntimeState {
             owed_reply_on_resume: None,
             interim_notes: Vec::new(),
             interim_transcript_lines: 0,
+            judged_transcript_lines: 0,
+            judged_last_turn: String::new(),
+            judged_code: String::new(),
+            judged_language: String::new(),
             interim_code: String::new(),
             earlier_steps_named: Vec::new(),
+            earlier_steps_pending: Vec::new(),
             code_shown: String::new(),
             end_requested: false,
             ended: false,
@@ -1116,6 +1148,12 @@ impl FrameworkPhase {
             Self::Situation | Self::Task | Self::Action | Self::Result
         )
     }
+
+    /// Coding, Test and Optimizations are all about code, so none of them is
+    /// reached while the editor holds nothing the candidate wrote.
+    pub(crate) fn needs_code(self) -> bool {
+        matches!(self, Self::Coding | Self::Test | Self::Optimizations)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1178,6 +1216,334 @@ fn evict_one_observation(evidence: &mut Vec<FrameworkEvidence>) {
     evidence.remove(doomed.unwrap_or(0));
 }
 
+/// The REACTO steps the phase judge records. Test is the platform's from the
+/// run itself; these are the ones only understanding can tick.
+const JUDGED_PHASES: [FrameworkPhase; 5] = [
+    FrameworkPhase::Repeat,
+    FrameworkPhase::Example,
+    FrameworkPhase::Algorithm,
+    FrameworkPhase::Coding,
+    FrameworkPhase::Optimizations,
+];
+
+/// Transcript the judge reads, the latest stretch within the bound. A tail
+/// rather than only what is new, so a step an earlier call missed can still be
+/// quoted while it is in reach.
+const PHASE_JUDGE_WINDOW_BYTES: usize = 6 * 1024;
+const PHASE_JUDGE_CODE_BYTES: usize = 6 * 1024;
+
+/// The fewest words a quote may have. A restatement, a worked case or an
+/// approach takes a sentence, so six; complexity is short ("it is O of n
+/// time") and Coding quotes code, so four. Either way a quote cannot be a
+/// stray phrase that happens to appear in a candidate line.
+const MIN_SPOKEN_QUOTE_WORDS: usize = 6;
+const MIN_QUOTE_WORDS: usize = 4;
+/// What the row keeps of the judge's summary and of the quote it was checked
+/// against. The quote goes into the row, so the report reads the words that
+/// were verified rather than only the judge's account of them.
+const MAX_PHASE_JUDGE_SUMMARY_CHARS: usize = 120;
+const MAX_PHASE_JUDGE_QUOTE_CHARS: usize = 110;
+
+/// The steps the judge may still record, in checklist spelling. None in the
+/// behavioral round, and none about code before there is code.
+///
+/// Not closed by the end of the interview: the end waits for a judgment of
+/// the candidate's last answer, and the report is written after it.
+///
+/// Repeat, Example and Algorithm are no longer asked about once Coding is
+/// recorded. A candidate who skipped one would otherwise keep a call due after
+/// every turn for the rest of the session, spending the budget before
+/// Optimizations, and what was said before or while the code was written was
+/// judged while it was. The interviewer can still record them.
+pub fn phase_judge_open(state: &RuntimeState) -> Vec<&'static str> {
+    if state.behavioral_round_started {
+        return Vec::new();
+    }
+    let coded = phases_evidenced(state, &[FrameworkPhase::Coding]);
+    let unrecorded = JUDGED_PHASES
+        .into_iter()
+        .filter(|phase| !phases_evidenced(state, &[*phase]))
+        .filter(|phase| phase.needs_code() || !coded)
+        .collect::<Vec<_>>();
+
+    // Asked last and once: whether there is code compares the editor with the
+    // starter, and nothing about code may still be open.
+    let has_code = unrecorded.iter().any(|phase| phase.needs_code()) && code_written(state);
+    unrecorded
+        .into_iter()
+        .filter(|phase| has_code || !phase.needs_code())
+        .map(phase_id)
+        .collect()
+}
+
+/// The candidate's latest turn, which the recognizer keeps rewriting in place
+/// while they speak, so a judge that read it halfway knows to read it again.
+fn last_candidate_line(state: &RuntimeState) -> &str {
+    last_speaker_line(&state.transcript, CANDIDATE_SPEAKER).map_or("", |(_, line)| line)
+}
+
+/// Whether there is anything new for the judge: a candidate turn it has not
+/// been shown, the latest one grown since, or for an open Coding step, an
+/// editor it has not read. The cursors are compared before the open steps are
+/// worked out, so an idle tick with nothing new costs two comparisons.
+pub fn phase_judge_due(state: &RuntimeState) -> bool {
+    let from = state.judged_transcript_lines.min(state.transcript.len());
+    let spoke = candidate_lines(&state.transcript[from..]) > 0
+        || last_candidate_line(state) != state.judged_last_turn;
+    let typed = state.code != state.judged_code || state.language != state.judged_language;
+    if !spoke && !typed {
+        return false;
+    }
+    let open = phase_judge_open(state);
+    if spoke {
+        !open.is_empty()
+    } else {
+        open.contains(&"coding")
+    }
+}
+
+/// The judge's prompt, with its cursors moved past what it shows.
+///
+/// Moved when the call goes out, as the interim window is: a call that fails
+/// costs nothing, because the next one reads the same tail.
+pub fn take_phase_judge_window(state: &mut RuntimeState, problem: &Problem) -> String {
+    // Only the tail is marked, since only the tail is sent.
+    let tail = &state.transcript[tail_start(&state.transcript, PHASE_JUDGE_WINDOW_BYTES)..];
+    let window = transcript_tail(&mark_unrecognized_turns(tail), PHASE_JUDGE_WINDOW_BYTES);
+    state.judged_transcript_lines = state.transcript.len();
+    state.judged_last_turn = last_candidate_line(state).to_string();
+    state.judged_code = state.code.clone();
+    state.judged_language = state.language.clone();
+    let open = phase_judge_open(state);
+    let code = if open
+        .iter()
+        .any(|id| matches!(*id, "coding" | "optimizations"))
+    {
+        code_head(&state.code, PHASE_JUDGE_CODE_BYTES)
+    } else {
+        String::new()
+    };
+    let prompt = phase_judge_prompt(&PhaseJudgeInput {
+        problem,
+        open: &open,
+        transcript_window: &window,
+        code: &code,
+        language: &state.language,
+    });
+    state.evidence_ledger.record_model_input(
+        ModelInputKind::Interim,
+        &format!("{}\n\n{prompt}", phase_judge_system_instruction()),
+    );
+    prompt
+}
+
+/// Lowercase words, punctuation dropped: a quote is checked for the words the
+/// candidate said, not for how the recognizer punctuated them.
+fn quote_words(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One speaker's turn, as `speaker_turns` reads the transcript.
+struct Turn {
+    speaker: &'static str,
+    /// Its normalized words, padded with a space at each end so a quote is
+    /// found as whole words with one `contains`.
+    words: String,
+}
+
+/// The transcript as turns: adjacent lines of one speaker joined, since the
+/// recognizer can split one answer into two lines with nothing between them.
+/// An unrecognized line ends a turn without joining one, as it carries no
+/// words.
+fn speaker_turns(state: &RuntimeState) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut joinable = false;
+    for line in &state.transcript {
+        let spoken = [CANDIDATE_SPEAKER, INTERVIEWER_SPEAKER]
+            .into_iter()
+            .find_map(|speaker| speaker_speech(line, speaker).map(|text| (speaker, text)));
+        let Some((speaker, text)) = spoken.filter(|_| !is_unrecognized_turn(line)) else {
+            joinable = false;
+            continue;
+        };
+        let words = quote_words(text);
+        match turns.last_mut() {
+            Some(turn) if joinable && turn.speaker == speaker => {
+                turn.words.push_str(&words);
+                turn.words.push(' ');
+            }
+            _ => turns.push(Turn {
+                speaker,
+                words: format!(" {words} "),
+            }),
+        }
+        joinable = true;
+    }
+    turns
+}
+
+/// Whether `quote` is the candidate's own: words from one recognized candidate
+/// turn, or for Coding, from what they typed into the editor.
+///
+/// Proof of who said it, not that the step was done; that judgment stays with
+/// the model and its prompt. What can be checked mechanically is checked: the
+/// starter is not the candidate's code, and an approach or an analysis the
+/// interviewer said before the candidate did is the candidate agreeing, not
+/// explaining. The interviewer saying it back afterwards, which is how an
+/// interviewer confirms they followed, leaves the candidate's words theirs.
+fn quote_is_grounded(
+    state: &RuntimeState,
+    turns: &[Turn],
+    phase: FrameworkPhase,
+    quote: &str,
+) -> bool {
+    let words = quote_words(quote);
+    let least = if phase.needs_code() {
+        MIN_QUOTE_WORDS
+    } else {
+        MIN_SPOKEN_QUOTE_WORDS
+    };
+    if words.split(' ').count() < least {
+        return false;
+    }
+    let needle = format!(" {words} ");
+    if phase == FrameworkPhase::Coding {
+        let typed = |code: &str| format!(" {} ", quote_words(code)).contains(&needle);
+        return typed(&state.code) && !typed(starter(state, &state.language));
+    }
+    let mut said = turns.iter().filter(|turn| turn.words.contains(&needle));
+    let Some(first) = said.clone().next() else {
+        return false;
+    };
+    if !said.any(|turn| turn.speaker == CANDIDATE_SPEAKER) {
+        return false;
+    }
+    let echo = matches!(
+        phase,
+        FrameworkPhase::Algorithm | FrameworkPhase::Optimizations
+    ) && first.speaker == INTERVIEWER_SPEAKER;
+    !echo
+}
+
+/// Records what the judge found, through the same gate the interviewer's calls
+/// pass, and returns the rows it added.
+///
+/// The judge is a model too, so nothing it says is taken on its word: the step
+/// has to be one still open when the answer lands, and the quote has to be the
+/// candidate's own words, or for Coding the editor's. A step the interviewer
+/// recorded while the call was out is no longer open and is left alone, and a
+/// judgment about code the candidate has since rewritten is dropped, since it
+/// would anchor an analysis of the old code to the new.
+pub fn apply_phase_judgment(state: &mut RuntimeState, text: &str) -> Vec<FrameworkEvidence> {
+    // A call that failed is answered with nothing, where a judgment is always
+    // JSON. Its window was marked read when it went out, so it is opened again
+    // here: otherwise the candidate's last answer, read by a call that failed,
+    // would wait for another turn that may never come.
+    if text.trim().is_empty() {
+        state.judged_transcript_lines = 0;
+        state.judged_last_turn.clear();
+        state.judged_code.clear();
+        return Vec::new();
+    }
+    let Ok(answer) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return Vec::new();
+    };
+    let Some(steps) = answer
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .filter(|steps| !steps.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    // Read once, as the call was asked: Coding recorded from this answer closes
+    // the spoken steps to later calls, not to a restatement listed after it.
+    // The transcript and the editor comparison are worked out only when a step
+    // needs them, since most answers find nothing.
+    let open = phase_judge_open(state);
+    let mut turns = None;
+    let mut code_current = None;
+    let mut recorded = Vec::new();
+    for step in steps.iter().take(JUDGED_PHASES.len()) {
+        let (Some(id), Some(quote)) = (
+            step.get("step").and_then(serde_json::Value::as_str),
+            step.get("quote").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(phase) = JUDGED_PHASES
+            .into_iter()
+            .find(|phase| phase_id(*phase) == id)
+        else {
+            continue;
+        };
+        if !open.contains(&id) || phases_evidenced(state, &[phase]) {
+            continue;
+        }
+        if phase.needs_code()
+            && !*code_current.get_or_insert_with(|| {
+                let judged = TestedCode {
+                    language: state.judged_language.clone(),
+                    code: state.judged_code.clone(),
+                };
+                covers(&judged, &state.language, &state.code)
+            })
+        {
+            continue;
+        }
+        let turns = turns.get_or_insert_with(|| speaker_turns(state));
+        if !quote_is_grounded(state, turns, phase, quote) {
+            continue;
+        }
+        let summary = step
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty());
+        let quoted = format!(
+            "\"{}\"",
+            bounded_model_text(quote.trim(), MAX_PHASE_JUDGE_QUOTE_CHARS)
+        );
+        let summary = match summary {
+            Some(summary) => format!(
+                "{} Quote: {quoted}",
+                bounded_model_text(summary, MAX_PHASE_JUDGE_SUMMARY_CHARS)
+            ),
+            None => format!("Quote: {quoted}"),
+        };
+        let source = if phase == FrameworkPhase::Coding {
+            "editor_snapshot"
+        } else {
+            "candidate_speech"
+        };
+        if let Ok((evidence, RecordOutcome::Added)) = record_evidence(
+            state,
+            &serde_json::json!({
+                "phase": id,
+                "source": source,
+                "kind": "observed",
+                "confidence": 70,
+                "summary": summary,
+            }),
+            true,
+        ) {
+            recorded.push(evidence);
+        }
+    }
+    recorded
+}
+
 /// One line of what a pause-time reviewer saw, bounded the way a summary is.
 ///
 /// The text is model output and reaches the report prompt, so it is trimmed to
@@ -1235,13 +1601,18 @@ pub fn code_written(state: &RuntimeState) -> bool {
     written_in(state, &state.language, &state.code)
 }
 
+/// The starter the page served for `language`, or nothing for one it did not.
+fn starter<'a>(state: &'a RuntimeState, language: &str) -> &'a str {
+    state
+        .code_templates
+        .get(language)
+        .map_or("", String::as_str)
+}
+
 /// Whether `code` holds code the candidate wrote over the starter of
 /// `language`.
 pub(crate) fn written_in(state: &RuntimeState, language: &str, code: &str) -> bool {
-    let template = state
-        .code_templates
-        .get(language)
-        .map_or("", String::as_str);
+    let template = starter(state, language);
 
     // Too long to compare is not written: the shortcut below already credits
     // anything that grew by the threshold, which is all a length can prove.
@@ -1295,23 +1666,31 @@ pub(crate) fn test_source(state: &RuntimeState) -> TestSource {
     }
 }
 
+/// Whether Test can be recorded now: it has no row yet, a received run still
+/// covers the code on screen, and that code is the candidate's. The one
+/// definition both the platform's own recording and the test reaction read.
+///
+/// Cheapest first, since a code update asks after every keystroke burst until
+/// Test is recorded: the row check, then the run's language and code, and only
+/// then whether the candidate wrote anything, which compares against the
+/// starter.
+pub(crate) fn test_recordable(state: &RuntimeState) -> bool {
+    !phases_evidenced(state, &[FrameworkPhase::Test])
+        && tested_code_is_current(state)
+        && code_written(state)
+}
+
 /// What a test reaction should say about recording Test after a run, given
-/// whether that run earned execution credit. The reminder follows the gate,
-/// not the run: an earlier run that still matches the editor keeps Test
-/// recordable through a later run that earned nothing, though that later
-/// run's counts are kept out of it. RunAgain is only for a run that earned
-/// credit the candidate has already typed past.
+/// whether that run earned execution credit. RunAgain is only for a run that
+/// earned credit the candidate has already typed past. A run that earned
+/// nothing is answered by `uncredited_test_results_reaction` instead, so it is
+/// Settled here whatever an earlier run left recordable.
 pub(crate) fn test_record_after_run(state: &RuntimeState, credited: bool) -> TestRecord {
-    // Cheapest first: after Test is recorded, a run compares nothing.
-    if phases_evidenced(state, &[FrameworkPhase::Test]) || !code_written(state) {
+    if !credited {
         TestRecord::Settled
-    } else if test_source(state) == TestSource::Run {
-        if credited {
-            TestRecord::Record
-        } else {
-            TestRecord::RecordEarlier
-        }
-    } else if credited {
+    } else if test_recordable(state) {
+        TestRecord::Record
+    } else if !phases_evidenced(state, &[FrameworkPhase::Test]) && code_written(state) {
         TestRecord::RunAgain
     } else {
         TestRecord::Settled
@@ -1527,6 +1906,37 @@ pub fn record_framework_evidence(
     state: &mut RuntimeState,
     args: &serde_json::Value,
 ) -> Result<FrameworkEvidence, &'static str> {
+    record_framework_evidence_outcome(state, args).map(|(evidence, _)| evidence)
+}
+
+/// What an accepted evidence call did. A call answered with a row already
+/// held added nothing, and telling the model "Recorded" then has it believe a
+/// note landed that was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordOutcome {
+    Added,
+    /// The same note again.
+    AlreadyHeld,
+    /// A Test row from a received run, which the platform records itself.
+    TestAlreadyRecorded,
+}
+
+/// `record_framework_evidence`, also saying what the call did.
+pub(crate) fn record_framework_evidence_outcome(
+    state: &mut RuntimeState,
+    args: &serde_json::Value,
+) -> Result<(FrameworkEvidence, RecordOutcome), &'static str> {
+    record_evidence(state, args, false)
+}
+
+/// The gate both callers pass. `quote_verified` is the phase judge's: its
+/// speech row carries a quote the server found in a recognized candidate turn,
+/// so a later turn the recognizer garbled says nothing about it.
+fn record_evidence(
+    state: &mut RuntimeState,
+    args: &serde_json::Value,
+    quote_verified: bool,
+) -> Result<(FrameworkEvidence, RecordOutcome), &'static str> {
     let phase = match args.get("phase").and_then(serde_json::Value::as_str) {
         Some("repeat") => FrameworkPhase::Repeat,
         Some("example") => FrameworkPhase::Example,
@@ -1565,19 +1975,6 @@ pub fn record_framework_evidence(
         );
     }
 
-    // Coding, Test and Optimizations are all about code, so none of them is
-    // reached while the editor holds nothing the candidate wrote: a plan spoken
-    // aloud is the Algorithm phase, and testing or improving it comes after
-    // there is something to run.
-    let about_code = matches!(
-        phase,
-        FrameworkPhase::Coding | FrameworkPhase::Test | FrameworkPhase::Optimizations
-    );
-    if about_code && kind != EvidenceKind::Skipped && !code_written(state) {
-        return Err(
-            "coding, test and optimizations need code the candidate has written in the editor; read_editor shows none yet",
-        );
-    }
     let confidence = args
         .get("confidence")
         .and_then(json_int)
@@ -1596,9 +1993,11 @@ pub fn record_framework_evidence(
     // The interviewer heard the audio the recognizer garbled, so a summary it
     // writes from that turn ("did not give the indices") would reach the report
     // as the candidate's speech even though the report never reads the turn
-    // itself. Speech evidence waits for a turn the report can read.
+    // itself. Speech evidence waits for a turn the report can read, unless its
+    // words were found in one.
     if source == EvidenceSource::CandidateSpeech
         && kind != EvidenceKind::Skipped
+        && !quote_verified
         && state
             .transcript
             .iter()
@@ -1611,6 +2010,30 @@ pub fn record_framework_evidence(
         );
     }
 
+    // Execution is already banked at receipt. A delayed model call must not
+    // replace its provenance or move its report timestamp to the reply.
+    if phase == FrameworkPhase::Test
+        && source == EvidenceSource::TestEvent
+        && kind != EvidenceKind::Skipped
+        && let Some(existing) = state.framework_evidence.iter().find(|item| {
+            item.phase == FrameworkPhase::Test
+                && item.source == EvidenceSource::TestEvent
+                && item.kind != EvidenceKind::Skipped
+        })
+    {
+        return Ok((existing.clone(), RecordOutcome::TestAlreadyRecorded));
+    }
+
+    // Coding, Test and Optimizations are all about code, so none of them is
+    // reached while the editor holds nothing the candidate wrote: a plan spoken
+    // aloud is the Algorithm phase, and testing or improving it comes after
+    // there is something to run.
+    if phase.needs_code() && kind != EvidenceKind::Skipped && !code_written(state) {
+        return Err(
+            "coding, test and optimizations need code the candidate has written in the editor; read_editor shows none yet",
+        );
+    }
+
     // Before the duplicate check, since a repeat is still the analysis given
     // again, now: "still O(n log n)" for rewritten code comes back under the
     // summary it had before. Nothing below refuses an Optimizations record.
@@ -1620,7 +2043,10 @@ pub fn record_framework_evidence(
     if let Some(index) = state.framework_evidence.iter().position(|item| {
         item.phase == phase && item.source == source && item.kind == kind && item.summary == summary
     }) {
-        return Ok(state.framework_evidence[index].clone());
+        return Ok((
+            state.framework_evidence[index].clone(),
+            RecordOutcome::AlreadyHeld,
+        ));
     }
 
     // After the duplicate check, so a resumed interviewer repeating a Test it
@@ -1650,16 +2076,40 @@ pub fn record_framework_evidence(
             }
             TestSource::Neither => {
                 return Err(
-                    "test evidence requires a received run with executed cases of the code now in the editor; ask the candidate to click Run, and record Test with source test_event as soon as the results arrive",
+                    "test evidence requires a received run with executed cases of the code now in the editor; ask the candidate to click Run; the platform records Test when qualifying results arrive",
                 );
             }
             TestSource::Run | TestSource::Trace => {}
         }
     }
+
+    Ok((
+        append_framework_evidence(
+            state,
+            phase,
+            source,
+            kind,
+            confidence as u8,
+            summary,
+            crate::current_epoch_millis(),
+        ),
+        RecordOutcome::Added,
+    ))
+}
+
+fn append_framework_evidence(
+    state: &mut RuntimeState,
+    phase: FrameworkPhase,
+    source: EvidenceSource,
+    kind: EvidenceKind,
+    confidence: u8,
+    summary: String,
+    receipt_timestamp_ms: u64,
+) -> FrameworkEvidence {
     if state.framework_evidence.len() == MAX_FRAMEWORK_EVIDENCE {
         evict_one_observation(&mut state.framework_evidence);
     }
-    state.framework_evidence.push(FrameworkEvidence {
+    let evidence = FrameworkEvidence {
         at_ms: state
             .started_at
             .elapsed()
@@ -1668,29 +2118,46 @@ pub fn record_framework_evidence(
         phase,
         source,
         kind,
-        confidence: confidence as u8,
+        confidence,
         summary,
         framework_version: FRAMEWORK_VERSION,
-    });
-    let evidence = state
-        .framework_evidence
-        .last()
-        .expect("just appended evidence")
-        .clone();
-
-    // `at_ms` is milliseconds since the interview started, which is what the
-    // report renders. The ledger stamps receipts with the epoch clock every
-    // other entry uses, so passing the elapsed value here put a third scale in
-    // a field that is read as one timeline. Read once for the call, so a second
-    // entry added here later shares this one's reading rather than taking its
-    // own, which is the rule the packet path already follows.
-    let receipt_timestamp_ms = crate::current_epoch_millis();
-    if evidence.kind != EvidenceKind::Skipped {
+    };
+    state.framework_evidence.push(evidence.clone());
+    if kind != EvidenceKind::Skipped {
         state
             .evidence_ledger
-            .record_coverage(receipt_timestamp_ms, phase_id(evidence.phase));
+            .record_coverage(receipt_timestamp_ms, phase_id(phase));
     }
-    Ok(evidence)
+    evidence
+}
+
+/// The summary of the Test row the platform records from a received run.
+pub const RECEIVED_TEST_SUMMARY: &str = "Browser reported executed test cases for the candidate's current code; results are unverified.";
+
+/// A received execution needs no model judgment to establish that testing
+/// happened. Counts remain browser claims and grant no correctness credit.
+///
+/// Recorded whenever Test becomes recordable, not only on the run that earned
+/// the credit: a run credited while the editor showed another language's
+/// starter becomes the code on screen again when the candidate switches back,
+/// and leaving that one to the model put Test back in the hands that missed it.
+/// Every event that can make it recordable asks here, so no prompt has to tell
+/// the model to record Test itself.
+pub(crate) fn reconcile_received_test(
+    state: &mut RuntimeState,
+    receipt_timestamp_ms: u64,
+) -> Option<FrameworkEvidence> {
+    (!state.ended && test_recordable(state)).then(|| {
+        append_framework_evidence(
+            state,
+            FrameworkPhase::Test,
+            EvidenceSource::TestEvent,
+            EvidenceKind::Observed,
+            100,
+            RECEIVED_TEST_SUMMARY.to_string(),
+            receipt_timestamp_ms,
+        )
+    })
 }
 
 /// Closes every STAR step that holds no row as skipped for session timing.
@@ -2082,7 +2549,12 @@ fn is_unrecognized_turn(line: &str) -> bool {
 
 /// What the candidate said in `line`, if it is their turn.
 fn candidate_speech(line: &str) -> Option<&str> {
-    line.strip_prefix(CANDIDATE_SPEAKER)
+    speaker_speech(line, CANDIDATE_SPEAKER)
+}
+
+/// What `speaker` said in `line`, if it is their turn.
+fn speaker_speech<'a>(line: &'a str, speaker: &str) -> Option<&'a str> {
+    line.strip_prefix(speaker)
         .and_then(|rest| rest.strip_prefix(": "))
 }
 

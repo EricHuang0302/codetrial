@@ -40,12 +40,13 @@ COUNTERS = (
 LIVE_SUMMARY = re.compile(r"\bcodetrial live_usage ")
 LIVE_EVENT = re.compile(r"\bcodetrial live_turn_usage ")
 HTTP_USAGE = re.compile(
-    r"\bgemini (report|interim) (?!transport_failed )(?=.*\busage )"
+    r"\bgemini (report|interim|phase) (?!transport_failed )(?=.*\busage )"
 )
 # A room name may contain a colon; the interim line's delimiter is the colon
 # followed by a space.
 TRANSPORT_FAILED = re.compile(r"\bgemini report transport_failed room=(\S+)")
 INTERIM_SKIPPED = re.compile(r"\binterim review skipped room=(\S+?): ")
+PHASE_SKIPPED = re.compile(r"\bphase judge skipped room=(\S+?): ")
 CONTEXT_REFRESH = re.compile(r"\bcodetrial context_refresh ")
 
 UNKNOWN = "unknown"
@@ -209,7 +210,11 @@ class Room:
         self.summaries = {}
         self.events = {}
         self.http = {}
-        self.failures = {"report_transport_failed": 0, "interim_skipped": 0}
+        self.failures = {
+            "report_transport_failed": 0,
+            "interim_skipped": 0,
+            "phase_judge_skipped": 0,
+        }
         self.refreshes = {}
 
     def report(self, room, warnings):
@@ -270,17 +275,24 @@ def analyze(lines, room_filter=None):
 
     for line in lines:
         # Every recognized line names one of these; most server lines do not.
-        if not any(word in line for word in ("codetrial ", "gemini ", "interim ")):
+        if not any(
+            word in line
+            for word in ("codetrial ", "gemini ", "interim ", "phase judge ")
+        ):
             continue
-        failure = TRANSPORT_FAILED.search(line) or INTERIM_SKIPPED.search(line)
+        failure = (
+            TRANSPORT_FAILED.search(line)
+            or INTERIM_SKIPPED.search(line)
+            or PHASE_SKIPPED.search(line)
+        )
         if failure:
             state = room_state(failure.group(1))
             if state is not None:
-                key = (
-                    "report_transport_failed"
-                    if failure.re is TRANSPORT_FAILED
-                    else "interim_skipped"
-                )
+                key = {
+                    TRANSPORT_FAILED: "report_transport_failed",
+                    INTERIM_SKIPPED: "interim_skipped",
+                    PHASE_SKIPPED: "phase_judge_skipped",
+                }[failure.re]
                 state.failures[key] += 1
             continue
         refresh = CONTEXT_REFRESH.search(line)

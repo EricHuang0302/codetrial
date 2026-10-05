@@ -1258,9 +1258,9 @@ fn the_ending_leaves_only_after_the_report_delivery_settles() {
     let source = include_str!("../../src/livekit.rs");
     // To the next item at column zero, as the source tests above read a body.
     let ending = source
-        .split("async fn handle_data_packet(")
+        .split("async fn apply_data_packet(")
         .nth(1)
-        .expect("handle_data_packet is still defined here")
+        .expect("apply_data_packet is still defined here")
         .split("\n}\n")
         .next()
         .unwrap_or_default();
@@ -1452,14 +1452,14 @@ fn code_restored_after_an_empty_review_is_sent_again() {
 /// cloned API key.
 #[tokio::test]
 async fn a_review_slot_clears_however_its_task_ended() {
-    let mut slot = InterimReview::default();
+    let mut slot = SideCall::default();
     assert!(!slot.is_running());
     assert!(slot.finished().is_none());
 
     // Bounded, like the drop cases below. A slot that stopped handing back
     // finished reviews would otherwise spin here until something outside the
     // test gave up, which reads as a hung suite rather than as the answer.
-    async fn collect(slot: &mut InterimReview) {
+    async fn collect(slot: &mut SideCall) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while slot.finished().is_none() {
                 tokio::task::yield_now().await;
@@ -1489,7 +1489,7 @@ async fn a_review_slot_clears_however_its_task_ended() {
         "never".to_string()
     });
     let watched = survivor.abort_handle();
-    let mut ending = InterimReview::default();
+    let mut ending = SideCall::default();
     ending.start(survivor);
     drop(ending);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1508,7 +1508,7 @@ async fn a_review_slot_clears_however_its_task_ended() {
         "never".to_string()
     });
     let watched = replaced.abort_handle();
-    let mut slot = InterimReview::default();
+    let mut slot = SideCall::default();
     slot.start(replaced);
     slot.start(tokio::spawn(async { "second".to_string() }));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3011,12 +3011,12 @@ fn the_prompt_log_fields_name_the_prompt_and_its_progress() {
     activity.mark_prompted(Instant::now(), None, false);
     assert_eq!(
         session::prompt_fields(&state, &activity),
-        "id=2 test_runs=1 evidenced=optimizations"
+        "id=2 test_runs=1 evidenced=test,optimizations"
     );
     let line = session::prompt_line(&state, &activity, "kind=briefing", "room-1");
     assert!(line.starts_with("prompt: at="), "{line}");
     assert!(
-        line.ends_with(" kind=briefing id=2 test_runs=1 evidenced=optimizations room=room-1"),
+        line.ends_with(" kind=briefing id=2 test_runs=1 evidenced=test,optimizations room=room-1"),
         "{line}"
     );
 }
@@ -5539,4 +5539,212 @@ fn reconnect_wait_uses_machine_reason_and_rounds_up() {
         reconnect_wait("retrying", None),
         serde_json::json!({ "type": "interviewer_state", "reconnecting": true, "reason": "retrying" })
     );
+}
+
+/// Only the end waits for the phase judge in the room loop, since waiting
+/// there stops the candidate's audio reaching the interviewer. A round
+/// transition that a judgment may still change is held instead, and nothing
+/// else waits: holding every control packet would stall the room.
+#[test]
+fn only_the_end_waits_for_the_phase_judge_and_a_round_transition_is_held() {
+    let control = |kind: &str| serde_json::json!({"type": kind, "round": "behavioral"});
+    let mut state = RuntimeState::default();
+    state.started_at -= Duration::from_secs(u64::from(state.coding_minutes) * 60);
+    assert!(settles_phase_judge(
+        &state,
+        TOPIC_CONTROL,
+        &control("end_interview")
+    ));
+    for other in [
+        "round_transition",
+        "thinking",
+        "pause_interview",
+        "time_warning",
+    ] {
+        assert!(
+            !settles_phase_judge(&state, TOPIC_CONTROL, &control(other)),
+            "{other}"
+        );
+    }
+    assert!(!settles_phase_judge(
+        &state,
+        crate::runtime::TOPIC_CODE_UPDATE,
+        &control("end_interview")
+    ));
+
+    // Held only while a judgment is in flight or due.
+    let transition = control("round_transition");
+    assert!(!defers_round_transition(
+        &RuntimeState::default(),
+        true,
+        TOPIC_CONTROL,
+        &transition
+    ));
+    assert!(!defers_round_transition(
+        &state,
+        true,
+        TOPIC_CONTROL,
+        &serde_json::json!({"type": "round_transition"})
+    ));
+    assert!(!defers_round_transition(
+        &state,
+        false,
+        TOPIC_CONTROL,
+        &transition
+    ));
+    assert!(defers_round_transition(
+        &state,
+        true,
+        TOPIC_CONTROL,
+        &transition
+    ));
+    state
+        .transcript
+        .push("Candidate: it runs in linear time overall".to_string());
+    assert!(defers_round_transition(
+        &state,
+        false,
+        TOPIC_CONTROL,
+        &transition
+    ));
+    assert!(!defers_round_transition(
+        &state,
+        true,
+        TOPIC_CONTROL,
+        &control("end_interview")
+    ));
+    state.round_transition_seen = true;
+    assert!(!defers_round_transition(
+        &state,
+        true,
+        TOPIC_CONTROL,
+        &transition
+    ));
+    state.round_transition_seen = false;
+    state.ended = true;
+    assert!(!settles_phase_judge(
+        &state,
+        TOPIC_CONTROL,
+        &control("end_interview")
+    ));
+    assert!(!defers_round_transition(
+        &state,
+        true,
+        TOPIC_CONTROL,
+        &transition
+    ));
+}
+
+/// A held transition is applied once nothing the candidate said is waiting
+/// for a judgment, or when the hold runs out. A judgment that finished on an
+/// older snapshot does not release it: the newer words get a judgment of their
+/// own while the hold lasts.
+#[tokio::test]
+async fn a_held_round_transition_waits_for_its_judgment_or_its_deadline() {
+    let now = Instant::now();
+    let late = now + PHASE_JUDGE_SETTLE;
+    let mut activity = RuntimeActivity::new(now);
+    assert!(
+        !activity.parked_transition_ready(now, false),
+        "nothing held"
+    );
+    assert!(
+        !activity.held_transition_needs_judgment(now, true),
+        "nothing held"
+    );
+    activity.pending_round_transition = Some(turn::ParkedPacket {
+        payload: serde_json::json!({"type": "round_transition"}),
+        received: true,
+        deadline: late,
+    });
+    assert!(
+        activity.parked_transition_ready(now, false),
+        "nothing to judge"
+    );
+
+    // Words since the last snapshot: held, and a judgment is asked for.
+    assert!(!activity.parked_transition_ready(now, true));
+    assert!(activity.held_transition_needs_judgment(now, true));
+    assert!(!activity.held_transition_needs_judgment(now, false));
+    assert!(
+        !activity.held_transition_needs_judgment(late, true),
+        "no time left"
+    );
+
+    // A judgment out holds it, whatever is due, until the deadline.
+    activity
+        .phase_judge
+        .start(tokio::spawn(std::future::pending::<String>()));
+    assert!(!activity.parked_transition_ready(now, false));
+    assert!(
+        !activity.held_transition_needs_judgment(now, true),
+        "one at a time"
+    );
+    assert!(activity.parked_transition_ready(late, true));
+}
+
+/// The room-loop wiring the pure checks above cannot see: the end settles the
+/// judge before the packet is applied, a held transition returns before it is,
+/// and the watch tick applies a held transition after collecting the judgment.
+#[test]
+fn the_room_loop_settles_the_end_and_holds_the_transition_before_applying_them() {
+    let source = include_str!("../../src/livekit.rs");
+    let body = |name: &str| {
+        source
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} is still defined here"))
+            .split("\n}\n")
+            .next()
+            .unwrap_or_default()
+    };
+    let packet = body("async fn handle_data_packet(");
+    let settle = packet
+        .find("settle_phase_judge(context")
+        .expect("the end settles");
+    let hold = packet
+        .find("pending_round_transition")
+        .expect("a transition is held");
+    let apply = packet
+        .find("apply_data_packet(")
+        .expect("packets are applied");
+    assert!(settle < apply && hold < apply);
+    assert!(packet[hold..apply].contains("return Ok(ControlFlow::Continue(()))"));
+    assert!(packet[..hold].contains("reserve_phase_judge("));
+    assert!(body("async fn settle_phase_judge(").contains("reserve_phase_judge("));
+
+    let tick = body("async fn on_watch_tick(");
+    let collect = tick
+        .find("phase_judge.finished()")
+        .expect("the tick collects");
+    let release = tick
+        .find("parked_transition_ready(")
+        .expect("the tick releases");
+    let publish = tick
+        .find("flush_framework_progress(")
+        .expect("the tick publishes what it collected");
+    assert!(collect < release && collect < publish);
+    assert!(tick[release..publish].contains("apply_data_packet("));
+    assert!(!tick[release..publish].contains("handle_data_packet("));
+    let application = body("async fn apply_data_packet(");
+    assert!(application.contains("apply_data_event_at("));
+    assert!(!application.contains("defers_round_transition("));
+    assert!(!application.contains("pending_round_transition"));
+
+    // Not on every turn of the room loop, which runs for every audio frame.
+    let room_loop = body("tokio::select! {");
+    assert!(!room_loop.contains("flush_framework_progress("));
+}
+
+/// A side call's slot hands its handle over once, running or finished, and is
+/// empty after: the end waits on what it took, and nothing else can.
+#[tokio::test]
+async fn a_side_call_hands_over_its_handle_once() {
+    let mut slot = SideCall::default();
+    assert!(slot.take().is_none());
+    slot.start(tokio::spawn(async { "done".to_string() }));
+    let handle = slot.take().expect("the started call");
+    assert!(!slot.is_running());
+    assert!(slot.take().is_none());
+    assert_eq!(handle.await.unwrap(), "done");
 }

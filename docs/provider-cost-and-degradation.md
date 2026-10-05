@@ -154,6 +154,19 @@ rate. `CODETRIAL_MAX_INTERIM_REVIEWS` defaults to 6, accepts `0` to disable
 the reviews, and is capped at 72. This is a quota guard, not a completeness
 limit: the final report still receives the complete transcript and editor state.
 
+The phase judge, which records the conversational REACTO steps from the
+candidate's own words, uses the same report model and keys. Every judgment
+needs a candidate turn or editor it has not read, or the window of a call that
+failed, and a step it records still open: Repeat, Example and Algorithm until
+Coding is recorded, Coding and Optimizations while there is code. On the watch
+tick one starts once the candidate has been quiet and not typing for 2 seconds,
+no more often than every 6 seconds. The end and a held round transition may
+start one sooner: the end waits at most 5 seconds in all for its judgments, and
+a round transition is held at most 5 seconds while the room keeps running.
+Both share the ceiling of 48 calls per interview. Each reads at most 6 KiB of
+transcript tail and 6 KiB of editor. A rate limit on a judgment does not cool
+the key, so the judge cannot leave the final report without one.
+
 ## What bounds concurrency
 
 The server admits at most `CODETRIAL_MAX_CONCURRENT_INTERVIEWS` live local
@@ -257,10 +270,11 @@ infer an account balance from them.
   `gemini_unreachable` or `billing`. It is written on every exit of the room
   loop, and once with `phase=startup` and no socket count when the interview
   failed before its first turn, a first open that was refused included.
-- `gemini report` and `gemini interim` lines carry the room, call number and
-  retry count of each HTTP call. A failed call has no usage line; every one is
-  counted from `gemini report transport_failed` (with `final=true` when it was
-  not retried) and `interim review skipped`, and none is assumed free.
+- `gemini report`, `gemini interim` and `gemini phase` lines carry the room,
+  call number and retry count of each HTTP call. A failed call has no usage
+  line; every one is counted from `gemini report transport_failed` (with
+  `final=true` when it was not retried), `interim review skipped` and
+  `phase judge skipped`, and none is assumed free.
 
 The counters keep prompt, response, cached, thought, tool-use prompt and total
 counts, plus modality details for prompt, response, tool-use and cached tokens.

@@ -3744,3 +3744,75 @@ fn a_self_review_check_with_multiple_policy_violations_is_dropped_once() {
         json!(["Verify the loop invariant"])
     );
 }
+
+/// The phase judge asks for JSON under its own instruction and hands back the
+/// text the server then checks. One key cannot tell the pools apart; which
+/// pool it spends, and what a failure does to it, is
+/// `a_rate_limited_phase_judge_does_not_cool_the_report_key`'s to show.
+#[tokio::test]
+async fn the_phase_judge_requests_json_under_its_own_instruction() {
+    let keys = GeminiKeys::single("phase-judge-key");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&bodies);
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(body);
+                axum::Json(
+                    json!({"candidates":[{"content":{"parts":[{"text":"{\"steps\": []}"}]}}]}),
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    assert_eq!(
+        generate_phase_judgment_at(&keys, &url, "prompt", "test-room")
+            .await
+            .unwrap(),
+        "{\"steps\": []}"
+    );
+    server.abort();
+    let body = bodies.lock().unwrap()[0].clone();
+    assert_eq!(
+        body["generationConfig"]["responseMimeType"],
+        "application/json"
+    );
+    assert_eq!(
+        body["systemInstruction"]["parts"][0]["text"],
+        crate::agent::phase_judge_system_instruction()
+    );
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "prompt");
+}
+
+/// A rate limit on the phase judge leaves the key on the report surface, where
+/// the same limit on an interim review cools it: the judge runs dozens of
+/// times an interview and must not be what leaves the final report keyless.
+#[tokio::test]
+async fn a_rate_limited_phase_judge_does_not_cool_the_report_key() {
+    for (judge, cools) in [(true, false), (false, true)] {
+        let first = format!("side-quota-{judge}-first");
+        let second = format!("side-quota-{judge}-second");
+        let config = live_config(&[("GOOGLE_API_KEYS", &format!("{first},{second}"))]);
+        let keys = GeminiKeys::from_config(&config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = if judge {
+            generate_phase_judgment_at(&keys, &url, "prompt", "test-room").await
+        } else {
+            generate_interim_review_at(&keys, &url, "prompt", "test-room").await
+        };
+        assert!(result.is_err());
+        server.abort();
+        let expected = if cools { &second } else { &first };
+        assert_eq!(&keys.select_report().unwrap(), expected, "judge={judge}");
+    }
+}

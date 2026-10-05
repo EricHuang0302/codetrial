@@ -330,6 +330,28 @@ fn prompt_samples() -> Value {
             evidence: &empty,
         }),
         "interimSystem": interim_system_instruction(),
+        "phaseJudge": phase_judge_prompt(&PhaseJudgeInput {
+            problem,
+            open: &["repeat", "optimizations"],
+            transcript_window: "Candidate: I return the indices of the two numbers.",
+            code: "seen = {}",
+            language: "python",
+        }),
+        "phaseJudgeSystem": phase_judge_system_instruction(),
+        "receivedTestNote": received_test_note(&RuntimeState::default(), false),
+        "phaseJudgmentNote": phase_judgment_note(
+            &RuntimeState::default(),
+            &[FrameworkEvidence {
+                at_ms: 0,
+                phase: FrameworkPhase::Repeat,
+                source: EvidenceSource::CandidateSpeech,
+                kind: EvidenceKind::Observed,
+                confidence: 70,
+                summary: "Restated it.".to_string(),
+                framework_version: FRAMEWORK_VERSION,
+            }],
+            false,
+        ),
         "reportSystem": report_system_instruction(),
         "testsPass": test_results_reaction("3/3 passed", true, TestRecord::Record, None, &RuntimeState::default(), SincePrevious::Other,),
         "testsFail": test_results_reaction(
@@ -556,13 +578,17 @@ fn prompt_samples() -> Value {
         &RuntimeState::default(),
         SincePrevious::Other,
     ));
-    prompts["testsRecordEarlier"] = json!(test_results_reaction(
+    prompts["testsRecordEarlier"] = json!(uncredited_test_results_reaction(
         "3/3 passed",
-        true,
-        TestRecord::RecordEarlier,
         None,
         &RuntimeState::default(),
-        SincePrevious::Other,
+        true,
+    ));
+    prompts["testsUncredited"] = json!(uncredited_test_results_reaction(
+        "3/3 passed",
+        None,
+        &RuntimeState::default(),
+        false,
     ));
     prompts["testsFailNotRecordable"] = json!(test_results_reaction(
         "2/3 passed",
@@ -783,8 +809,28 @@ fn evaluation_reaction(case: &Value, state: &mut RuntimeState) -> String {
 }
 
 fn record_evaluation_evidence(state: &mut RuntimeState, item: &Value, id: &str) -> String {
+    let existing_test = (item["phase"] == "test" && item["source"] == "test_event")
+        .then(|| {
+            state
+                .framework_evidence
+                .iter()
+                .find(|row| {
+                    row.phase == FrameworkPhase::Test
+                        && row.source == EvidenceSource::TestEvent
+                        && row.kind != EvidenceKind::Skipped
+                })
+                .cloned()
+        })
+        .flatten();
     let recorded = record_framework_evidence(state, item)
         .unwrap_or_else(|error| panic!("{id}: invalid evidence: {error}"));
+    if let Some(existing) = existing_test {
+        assert_eq!(
+            recorded, existing,
+            "{id}: a model call must retain the received Test row"
+        );
+        return "test".to_string();
+    }
     let recorded_json = framework_evidence_json(&recorded);
     for key in ["phase", "source", "kind", "confidence", "summary"] {
         assert_eq!(

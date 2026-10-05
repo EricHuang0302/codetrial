@@ -422,7 +422,8 @@ fn an_interview_past_the_evidence_cap_still_reports_every_phase_it_reached() {
     }
 
     let prompt = report_prompt_text(&boot, &state, 45.0);
-    for phase in ["repeat", "example", "algorithm", "test", "optimizations"] {
+    assert!(prompt.contains("Browser reported executed test cases"));
+    for phase in ["repeat", "example", "algorithm", "optimizations"] {
         assert!(
             prompt.contains(&format!("Candidate completed {phase}.")),
             "the opening phases must survive an interview that overran the cap"
