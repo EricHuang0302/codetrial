@@ -37,24 +37,27 @@ after(async () => {
 });
 
 async function openInterview(width, height, query = "", drawing = false) {
+  let unlocked;
+  if (drawing) {
+    const source = read("web/interview.js");
+    unlocked = source.replace(
+      /locked: \(\) =>\s*!board\.ready \|\|\s*state\.phase !== "live" \|\|\s*frameworkRound !== "coding"/,
+      "locked: () => false",
+    );
+    assert.notEqual(
+      unlocked,
+      source,
+      "the example board's lock moved; update openInterview's pattern",
+    );
+  }
   const page = await browser.newPage({ viewport: { width, height } });
   if (drawing)
-    await page.route("**/interview.js", (route) => {
-      const source = read("web/interview.js");
-      const unlocked = source.replace(
-        /locked: \(\) =>\s*!board\.ready \|\|\s*state\.phase !== "live" \|\|\s*frameworkRound !== "coding"/,
-        "locked: () => false",
-      );
-      assert.notEqual(
-        unlocked,
-        source,
-        "the example board's lock moved; update openInterview's pattern",
-      );
-      return route.fulfill({
+    await page.route("**/interview.js", (route) =>
+      route.fulfill({
         contentType: "text/javascript",
         body: unlocked,
-      });
-    });
+      }),
+    );
   await page.goto(
     `${base}/interview.html?problem=chargeback-pair-match${query}`,
     { waitUntil: "domcontentloaded" },
@@ -969,16 +972,22 @@ test("local recording controls preserve the original problem reading space", asy
 // handlers run with an editable board, without joining a provider.
 test("expanded drawing text controls stay reachable beside long captions and self-view", async (t) => {
   if (!browser) return t.skip("playwright chromium unavailable");
-  for (const [width, height] of [
+  for (const [width, height, wideSidebar] of [
     [1280, 800],
     [1440, 900],
     [1920, 1080],
     [1250, 630],
     [1024, 768],
+    [1024, 768, true],
+    [1280, 800, true],
   ]) {
     const page = await openInterview(width, height, "&exampleDrawing=1", true);
     try {
       await closeSetupCheck(page);
+      if (wideSidebar) {
+        await page.locator("#sidebar-resizer").focus();
+        await page.keyboard.press("End");
+      }
       await page
         .locator("#example-board")
         .evaluate((node) => (node.open = true));
@@ -999,7 +1008,12 @@ test("expanded drawing text controls stay reachable beside long captions and sel
         surface.width >= 280,
         `${width}px: text controls fit at full width`,
       );
-      if (width === 1280) {
+      const card = await page.locator("#jim-stage").boundingBox();
+      assert.ok(
+        surface.x + surface.width <= card.x,
+        `${width}px: the caption card stays beside the drawing`,
+      );
+      if (width === 1280 && !wideSidebar) {
         await page.evaluate(() =>
           document.documentElement.style.setProperty(
             "--jim-card-width",
@@ -1043,6 +1057,17 @@ test("expanded drawing text controls stay reachable beside long captions and sel
           await button.click();
           await page.locator(".board-text-draft").waitFor({ state: "hidden" });
         }
+      }
+      if (wideSidebar) {
+        await page.getByRole("button", { name: "Shrink drawing" }).click();
+        await settled(page);
+        assert.equal(
+          await page
+            .locator("#jim-stage")
+            .evaluate((node) => node.style.maxWidth),
+          "",
+          "shrinking restores the normal caption card width",
+        );
       }
     } finally {
       await page.close();

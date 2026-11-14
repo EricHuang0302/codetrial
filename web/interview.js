@@ -307,6 +307,9 @@ const JIM_AVATAR_PANEL_MIN_REM = 49;
 /// Below this window width the editor is narrow enough that a floating avatar
 /// eats code rather than decorating it, whatever the sidebar does.
 const JIM_STAGE_NARROW_WINDOW = "(max-width: 1200px)";
+const JIM_DRAWING_DESKTOP_WINDOW = "(min-width: 1024px)";
+// Match styles.css: 17.5rem drawing, 2rem pane padding and a 1.5rem gap.
+const JIM_DRAWING_RESERVED_REM = 21;
 /// In rem. A fixed ladder rather than a free number, so a stored value is
 /// either one of these or ignored, and every size the page can show is one the
 /// browser check has seen keep the three editor layers in line.
@@ -5390,14 +5393,20 @@ function testDrawerBounds() {
 /// result.
 function compactJimStageBesideNarrowPanel(panel) {
   const narrowWindow = matchMedia(JIM_STAGE_NARROW_WINDOW);
+  const desktopDrawing = matchMedia(JIM_DRAWING_DESKTOP_WINDOW);
   const example = document.querySelector("#example-board");
   const fit = () => {
     const rem = Number.parseFloat(
       getComputedStyle(document.documentElement).fontSize,
     );
+    const panelWidth = panel.getBoundingClientRect().width;
+    nodes.jimStage.style.maxWidth =
+      example?.hasAttribute("data-expanded") && desktopDrawing.matches
+        ? `${Math.max(0, panelWidth - JIM_DRAWING_RESERVED_REM * rem)}px`
+        : "";
     const compact =
       narrowWindow.matches ||
-      panel.getBoundingClientRect().width < JIM_AVATAR_PANEL_MIN_REM * rem ||
+      panelWidth < JIM_AVATAR_PANEL_MIN_REM * rem ||
       example?.hasAttribute("data-expanded") === true;
     nodes.jimStage.classList.toggle("compact", compact);
     // Hide avatar goes with the avatar, so focus left on it moves to the
@@ -5408,6 +5417,7 @@ function compactJimStageBesideNarrowPanel(panel) {
   if (window.ResizeObserver) new window.ResizeObserver(fit).observe(panel);
   else window.addEventListener("resize", fit);
   narrowWindow.addEventListener("change", fit);
+  desktopDrawing.addEventListener("change", fit);
   // A whiteboard interview has removed the editor panel by now, and the board
   // inside it, so there is no board to watch.
   if (example)

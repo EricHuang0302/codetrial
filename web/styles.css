@@ -1825,7 +1825,10 @@ p {
 /* Reserve the card's strip only beside the editor, not on stacked screens. */
 @media (min-width: 1024px) {
   .example-board[data-expanded] .example-surface {
-    margin-right: calc(var(--jim-card-width) + 1.5rem);
+    margin-right: min(
+      calc(var(--jim-card-width) + 1.5rem),
+      max(0px, 100% - 17.5rem)
+    );
   }
 }
 
